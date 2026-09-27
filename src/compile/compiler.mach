@@ -10,8 +10,6 @@
 
 use A: std.allocator;
 use std.allocator.testing;
-use std.collections.map;
-use std.collections.map.Map;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use std.types.bool.bool;
@@ -49,6 +47,12 @@ pub val MAX_INSTS: usize = 1048576;
 # a trie edge with no child state ends a sequence
 val LEAF: u32 = 0xFFFFFFFF;
 
+# a free slot in the range cache
+val EMPTY: u32 = 0xFFFFFFFF;
+
+# a node whose utf-8 sequences are not yet known
+val NO_MEMO: u64 = 0xFFFFFFFFFFFFFFFF;
+
 # a state of a class's trie
 # ---
 # first: its first edge, LEAF when it has none
@@ -75,33 +79,41 @@ rec Edge {
 
 # the state of one compilation
 # ---
-# tree:    the Ast
-# prog:    the program being built
-# reverse: the program reads the text right to left
-# failed:  an error was recorded
-# err:     the first error
-# set:     the code points of the class being compiled
-# part:    one member's code points
-# tmp:     scratch for negation
-# seqs:    the utf-8 sequences of the class
-# states:  the trie's states
-# edges:   the trie's edges
-# cache:   one-range instructions by range and successor
-# null:    whether each node can match empty, 0 when not yet known, 1 no, 2 yes
+# tree:      the Ast
+# prog:      the program being built
+# reverse:   the program reads the text right to left
+# failed:    an error was recorded
+# err:       the first error
+# set:       the code points of the class being compiled
+# part:      one member's code points
+# tmp:       scratch for negation
+# seqs:      the utf-8 sequences of the class
+# states:    the trie's states
+# edges:     the trie's edges
+# keys:      the range cache's keys, a range and its successor, open addressed
+# vals:      the one-range instruction for each key, EMPTY for a free slot
+# filled:    keys in the range cache
+# memo:      each node's utf-8 sequences in memo_seqs, start and length, or NO_MEMO
+# memo_seqs: the utf-8 sequences of every class node compiled so far
+# null:      whether each node can match empty, 0 when not yet known, 1 no, 2 yes
 rec Compiler {
-    tree:    *syntax.Ast;
-    prog:    *Prog;
-    reverse: bool;
-    failed:  bool;
-    err:     syntax.Error;
-    set:     Vector[Range];
-    part:    Vector[Range];
-    tmp:     Vector[Range];
-    seqs:    Vector[Seq];
-    states:  Vector[State];
-    edges:   Vector[Edge];
-    cache:   Map[u64, u32];
-    null:    Vector[u8];
+    tree:      *syntax.Ast;
+    prog:      *Prog;
+    reverse:   bool;
+    failed:    bool;
+    err:       syntax.Error;
+    set:       Vector[Range];
+    part:      Vector[Range];
+    tmp:       Vector[Range];
+    seqs:      Vector[Seq];
+    states:    Vector[State];
+    edges:     Vector[Edge];
+    keys:      Vector[u64];
+    vals:      Vector[u32];
+    filled:    usize;
+    memo:      Vector[u64];
+    memo_seqs: Vector[Seq];
+    null:      Vector[u8];
 }
 
 # compile an Ast to a program
@@ -129,17 +141,21 @@ pub fun reverse(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
 fun generate(a: *A.Allocator, tree: *syntax.Ast, backward: bool) res[Prog, syntax.Error] {
     var p: Prog     = prog.init(a);
     var c: Compiler = Compiler{
-        tree:    tree,
-        prog:    ?p,
-        reverse: backward,
-        set:     vector.init[Range](a),
-        part:    vector.init[Range](a),
-        tmp:     vector.init[Range](a),
-        seqs:    vector.init[Seq](a),
-        states:  vector.init[State](a),
-        edges:   vector.init[Edge](a),
-        cache:   map.init[u64, u32](a),
-        null:    vector.init[u8](a),
+        tree:      tree,
+        prog:      ?p,
+        reverse:   backward,
+        set:       vector.init[Range](a),
+        part:      vector.init[Range](a),
+        tmp:       vector.init[Range](a),
+        seqs:      vector.init[Seq](a),
+        states:    vector.init[State](a),
+        edges:     vector.init[Edge](a),
+        keys:      vector.init[u64](a),
+        vals:      vector.init[u32](a),
+        filled:    0,
+        memo:      vector.init[u64](a),
+        memo_seqs: vector.init[Seq](a),
+        null:      vector.init[u8](a),
     };
     fin {
         vector.dnit[Range](?c.set);
@@ -148,14 +164,19 @@ fun generate(a: *A.Allocator, tree: *syntax.Ast, backward: bool) res[Prog, synta
         vector.dnit[Seq](?c.seqs);
         vector.dnit[State](?c.states);
         vector.dnit[Edge](?c.edges);
-        map.dnit[u64, u32](?c.cache);
+        vector.dnit[u64](?c.keys);
+        vector.dnit[u32](?c.vals);
+        vector.dnit[u64](?c.memo);
+        vector.dnit[Seq](?c.memo_seqs);
         vector.dnit[u8](?c.null);
     }
 
+    if (!slots(?c, 256)) { fail(?c, Kind.memory{}, 0); }
     var k: usize = 0;
     for (k < tree.nodes.len) {
+        val memo:   res[usize, A.Error] = vector.push[u64](?c.memo, NO_MEMO);
         val pushed: res[usize, A.Error] = vector.push[u8](?c.null, 0);
-        if (sel pushed.err) {
+        if (sel pushed.err || sel memo.err) {
             fail(?c, Kind.memory{}, 0);
             brk;
         }
@@ -272,16 +293,72 @@ fun emit(c: *Compiler, i: Inst) u32 {
     ret (c.prog.insts.len - 1)::u32;
 }
 
+# size the range cache to n free slots, n a power of two
+fun slots(c: *Compiler, n: usize) bool {
+    val keys: res[usize, A.Error] = vector.ensure[u64](?c.keys, n);
+    val vals: res[usize, A.Error] = vector.ensure[u32](?c.vals, n);
+    if (sel keys.err || sel vals.err) { ret false; }
+    c.keys.len = n;
+    c.vals.len = n;
+    var k: usize = 0;
+    for (k < n) {
+        c.vals.data[k] = EMPTY;
+        k              = k + 1;
+    }
+    ret true;
+}
+
+# where a key sits in the range cache, or the free slot it would take
+fun slot(c: *Compiler, key: u64) usize {
+    val mask: usize = c.keys.len - 1;
+    var at:   usize = ((key * 0x9E3779B97F4A7C15) >> 32)::usize & mask;
+    for (c.vals.data[at] != EMPTY && c.keys.data[at] != key) { at = (at + 1) & mask; }
+    ret at;
+}
+
+# double the range cache, placing every key again
+fun grow(c: *Compiler) bool {
+    val n:    usize       = c.keys.len;
+    var keys: Vector[u64] = c.keys;
+    var vals: Vector[u32] = c.vals;
+    c.keys = vector.init[u64](keys.a);
+    c.vals = vector.init[u32](vals.a);
+    val ok: bool = slots(c, n * 2);
+    if (ok) {
+        var k: usize = 0;
+        for (k < n) {
+            if (vals.data[k] != EMPTY) {
+                val at: usize = slot(c, keys.data[k]);
+                c.keys.data[at] = keys.data[k];
+                c.vals.data[at] = vals.data[k];
+            }
+            k = k + 1;
+        }
+    }
+    vector.dnit[u64](?keys);
+    vector.dnit[u32](?vals);
+    ret ok;
+}
+
 # a one-range instruction, shared with any identical one already emitted
 fun range(c: *Compiler, lo: u8, hi: u8, next: u32) u32 {
-    val key: u64       = (lo::u64 << 40) | (hi::u64 << 32) | next::u64;
-    val hit: opt[*u32] = map.get[u64, u32](?c.cache, ?key);
-    if (sel hit.some) { ret @hit.some; }
-    val at: u32 = emit(c, Inst.range{Trans{lo: lo, hi: hi, next: next}});
+    val key: u64   = (lo::u64 << 40) | (hi::u64 << 32) | next::u64;
+    var at:  usize = slot(c, key);
+    if (c.vals.data[at] != EMPTY) { ret c.vals.data[at]; }
+    val inst: u32 = emit(c, Inst.range{Trans{lo: lo, hi: hi, next: next}});
     if (c.failed) { ret 0; }
-    val stored: res[bool, A.Error] = map.insert[u64, u32](?c.cache, key, at);
-    if (sel stored.err) { fail(c, Kind.memory{}, 0); }
-    ret at;
+    # at most half full, so a probe always ends at a free slot
+    if ((c.filled + 1) * 2 > c.keys.len) {
+        if (!grow(c)) {
+            fail(c, Kind.memory{}, 0);
+            ret 0;
+        }
+        at = slot(c, key);
+    }
+    c.keys.data[at] = key;
+    c.vals.data[at] = inst;
+    c.filled        = c.filled + 1;
+    ret inst;
 }
 
 # whether a node can match the empty string
@@ -322,18 +399,16 @@ fun nullable(c: *Compiler, i: usize) bool {
 fun node(c: *Compiler, i: usize, next: u32) u32 {
     if (c.failed) { ret 0; }
     val n: Node = c.tree.nodes.data[i];
-    if (sel n.empty)   { ret next; }
-    if (sel n.literal) { ret literal(c, n.literal.cp, n.literal.fold, next); }
-    if (sel n.class)   { ret class(c, c.tree.classes.data[n.class], next); }
-    if (sel n.any) {
-        c.set.len = 0;
-        if (!ranges.append(?c.set, 0, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
-        ret set(c, next);
+    if (sel n.empty) { ret next; }
+    if (sel n.literal) {
+        if (!n.literal.fold) { ret literal(c, n.literal.cp, false, next); }
     }
-    if (sel n.any_but_newline) {
-        c.set.len = 0;
-        if (!ranges.append(?c.set, 0, 9) || !ranges.append(?c.set, 11, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
-        ret set(c, next);
+    # a class repeated, as in x{0,100}, compiles its code points once
+    if (sel n.literal || sel n.class || sel n.any || sel n.any_but_newline) {
+        if (recall(c, i)) { ret automaton(c, next); }
+        val at: u32 = code_points(c, n, next);
+        keep(c, i);
+        ret at;
     }
     if (sel n.begin_line)        { ret look(c, Assert.begin_line{}, next); }
     if (sel n.end_line)          { ret look(c, Assert.end_line{}, next); }
@@ -379,6 +454,55 @@ fun node(c: *Compiler, i: usize, next: u32) u32 {
         ret at;
     }
     ret next;
+}
+
+# compile a folded literal, a class or a dot, gathering its code points
+fun code_points(c: *Compiler, n: Node, next: u32) u32 {
+    if (sel n.literal) { ret literal(c, n.literal.cp, n.literal.fold, next); }
+    if (sel n.class)   { ret class(c, c.tree.classes.data[n.class], next); }
+    c.set.len = 0;
+    if (sel n.any) {
+        if (!ranges.append(?c.set, 0, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
+    }
+    or {
+        if (!ranges.append(?c.set, 0, 9) || !ranges.append(?c.set, 11, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
+    }
+    ret set(c, next);
+}
+
+# put a node's utf-8 sequences, kept when it was first compiled, in c.seqs
+fun recall(c: *Compiler, i: usize) bool {
+    val m: u64 = c.memo.data[i];
+    if (m == NO_MEMO) { ret false; }
+    val start: usize = (m >> 32)::usize;
+    val len:   usize = (m & 0xFFFFFFFF)::usize;
+    c.seqs.len = 0;
+    var k: usize = 0;
+    for (k < len) {
+        val pushed: res[usize, A.Error] = vector.push[Seq](?c.seqs, c.memo_seqs.data[start + k]);
+        if (sel pushed.err) {
+            fail(c, Kind.memory{}, 0);
+            ret false;
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# keep the utf-8 sequences in c.seqs as a node's
+fun keep(c: *Compiler, i: usize) {
+    if (c.failed) { ret; }
+    val start: usize = c.memo_seqs.len;
+    var k:     usize = 0;
+    for (k < c.seqs.len) {
+        val pushed: res[usize, A.Error] = vector.push[Seq](?c.memo_seqs, c.seqs.data[k]);
+        if (sel pushed.err) {
+            fail(c, Kind.memory{}, 0);
+            ret;
+        }
+        k = k + 1;
+    }
+    c.memo.data[i] = (start::u64 << 32) | c.seqs.len::u64;
 }
 
 fun look(c: *Compiler, a: Assert, next: u32) u32 {
@@ -545,12 +669,18 @@ fun set(c: *Compiler, next: u32) u32 {
         }
         k = k + 1;
     }
+    ret automaton(c, next);
+}
+
+# compile the utf-8 sequences in c.seqs to their automaton
+fun automaton(c: *Compiler, next: u32) u32 {
+    if (c.failed)        { ret 0; }
     if (c.seqs.len == 0) { ret emit(c, Inst.fail{}); }
     if (c.reverse)       { ret backward(c, next); }
     c.states.len = 0;
     c.edges.len  = 0;
     if (!state(c)) { ret 0; }
-    k = 0;
+    var k: usize = 0;
     for (k < c.seqs.len) {
         if (!insert(c, c.seqs.data[k])) { ret 0; }
         k = k + 1;
