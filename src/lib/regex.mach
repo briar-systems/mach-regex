@@ -1,10 +1,36 @@
 # regular expressions with RE2 syntax, matched in linear time
 #
-# the public surface of mach-regex. each public module is forwarded here as it
-# arrives, so consumers write `use regex;` and reach everything through it.
+# the public surface of mach-regex, so consumers write `use regex;` and reach
+# everything through it. the syntax tree, the compiler and the unicode tables
+# stay reachable by their full paths, regex.syntax, regex.compile and
+# regex.unicode, for tools that need them.
 
 use std.runtime;
 
-fwd regex.unicode;
-fwd regex.syntax;
-fwd regex.compile;
+use regex.api;
+use regex.syntax;
+
+fwd api.Cache;
+fwd api.Iter;
+fwd api.Match;
+fwd api.NONE;
+fwd api.Options;
+fwd api.Regex;
+fwd api.cache;
+fwd api.cache_dnit;
+fwd api.captures;
+fwd api.compile;
+fwd api.compile_with;
+fwd api.dnit;
+fwd api.error_text;
+fwd api.find;
+fwd api.group_count;
+fwd api.group_index;
+fwd api.group_name;
+fwd api.is_match;
+fwd api.iter;
+fwd api.next;
+fwd api.quote;
+fwd api.slot_count;
+fwd syntax.Error;
+fwd syntax.Kind;
