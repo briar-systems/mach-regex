@@ -8,12 +8,13 @@ The compiler version is `mach-version` in `.github/workflows/ci.yml`, within the
 ```sh
 mach dep pull .
 mach build .
-mach test . --lib tests
+mach test .
 ```
 
-The tests are the `tests` artifact, `src/lib/tests.mach`, which reaches every
-module under `src/test/`. Mach tests one artifact's closure, so a test module
-that `tests.mach` does not reach does not run.
+Tests are `test` blocks in the module they test, and the library reaches every
+module, so `mach test .` runs them all. The suites that exercise the whole API,
+searching and conformance, are in `src/api.mach`. `--filter` narrows a run, as
+`mach test . --filter parse`.
 
 Formatting is checked in CI for the library and every demo:
 
@@ -31,7 +32,7 @@ mach fmt --check demo/search
 | `src/exec/` | the Pike VM that runs a program over a text |
 | `src/api.mach` | the public API, forwarded by `src/lib/regex.mach` |
 | `src/unicode/` | the generated Unicode tables and their lookups |
-| `src/test/` | the tests, with the conformance data in `src/test/data/` |
+| `src/data/` | the conformance data, embedded by `src/api.mach` |
 | `demo/` | one example program per project, built by CI |
 | `doc/` | the generated API reference and the hand-written guides in `doc/guide/` |
 | `tools/` | generators for committed sources |
@@ -71,9 +72,9 @@ what the tool generates.
 
 ## Conformance
 
-`src/test/data/re2-search.txt` is RE2's search test data as Go's
-`regexp/testdata` carries it, under the license beside it, and
-`src/test/conformance.mach` runs every check in it. The data is marked `-text`
+`src/data/re2-search.txt` is RE2's search test data as Go's
+`regexp/testdata` carries it, under the license beside it, and the
+`conformance__re2_search` test in `src/api.mach` runs every check in it. The data is marked `-text`
 in `.gitattributes` so that no checkout rewrites its line endings. A change
 that makes any check fail is a change to RE2's semantics, and needs a reason
 that RE2 itself would accept.
