@@ -1,0 +1,80 @@
+# why a pattern is not a regular expression
+#
+# every error names its kind and the byte offset in the pattern where the
+# offending text begins. the kinds follow the errors RE2 and Go's
+# regexp/syntax report, with memory and duplicate names as their own kinds.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+# the kind of a syntax error
+# ---
+# missing_bracket:         a [ is never closed
+# missing_paren:           a ( is never closed
+# unexpected_paren:        a ) closes no group
+# trailing_backslash:      the pattern ends in a lone backslash
+# invalid_escape:          a backslash escape RE2 does not define
+# missing_repeat_argument: a repetition operator follows nothing
+# invalid_repeat_op:       a repetition operator follows another
+# invalid_repeat_size:     a bound is over 1000 or the minimum exceeds the maximum
+# invalid_char_class:      a \p escape with no name or an unclosed brace
+# invalid_char_range:      a range whose end precedes its start, or an unknown class name
+# invalid_named_capture:   a group name that is empty or not a word
+# duplicate_capture_name:  two groups share a name
+# invalid_perl_op:         a (? construct RE2 does not define
+# invalid_utf8:            the pattern is not valid utf-8
+# nesting_depth:           groups nest more than 1000 deep
+# large:                   the compiled program would be too large
+# memory:                  the allocator refused while parsing or compiling
+pub tag Kind: u8 {
+    missing_bracket;
+    missing_paren;
+    unexpected_paren;
+    trailing_backslash;
+    invalid_escape;
+    missing_repeat_argument;
+    invalid_repeat_op;
+    invalid_repeat_size;
+    invalid_char_class;
+    invalid_char_range;
+    invalid_named_capture;
+    duplicate_capture_name;
+    invalid_perl_op;
+    invalid_utf8;
+    nesting_depth;
+    large;
+    memory;
+}
+
+# a syntax error
+# ---
+# kind:   what is wrong
+# offset: the byte offset in the pattern where it begins
+pub rec Error {
+    kind:   Kind;
+    offset: usize;
+}
+
+# the message for an error kind
+# ---
+# k:   the kind
+# ret: a lowercase description, as RE2 words it
+pub fun text(k: Kind) str {
+    if (sel k.missing_bracket)         { ret "missing closing ]"; }
+    if (sel k.missing_paren)           { ret "missing closing )"; }
+    if (sel k.unexpected_paren)        { ret "unexpected )"; }
+    if (sel k.trailing_backslash)      { ret "trailing backslash at end of expression"; }
+    if (sel k.invalid_escape)          { ret "invalid escape sequence"; }
+    if (sel k.missing_repeat_argument) { ret "missing argument to repetition operator"; }
+    if (sel k.invalid_repeat_op)       { ret "invalid nested repetition operator"; }
+    if (sel k.invalid_repeat_size)     { ret "invalid repeat count"; }
+    if (sel k.invalid_char_class)      { ret "invalid character class"; }
+    if (sel k.invalid_char_range)      { ret "invalid character class range"; }
+    if (sel k.invalid_named_capture)   { ret "invalid named capture"; }
+    if (sel k.duplicate_capture_name)  { ret "duplicate capture group name"; }
+    if (sel k.invalid_perl_op)         { ret "invalid or unsupported Perl syntax"; }
+    if (sel k.invalid_utf8)            { ret "invalid UTF-8"; }
+    if (sel k.nesting_depth)           { ret "expression nests too deeply"; }
+    if (sel k.large)                   { ret "expression too large"; }
+    ret "out of memory";
+}

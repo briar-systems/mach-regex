@@ -1,0 +1,219 @@
+# the abstract syntax of a parsed pattern
+#
+# nodes live in one vector and refer to each other by index, so an Ast is a
+# handful of flat vectors with no pointers between nodes. the children of a
+# concatenation or an alternation are a span of the kids vector, a class's
+# members are a span of the items vector, and a set's ranges a span of the
+# ranges vector. names and unicode class names borrow the pattern's bytes, so
+# the pattern outlives the Ast that was parsed from it.
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.view.View;
+
+# the most a repetition may take, standing for no upper bound
+pub val UNBOUNDED: u32 = 0xFFFFFFFF;
+
+# the flags in force where a node was parsed
+# ---
+# fold:      letters match in any case, (?i)
+# multiline: ^ and $ match at line boundaries, (?m)
+# dotnl:     . matches a newline, (?s)
+# ungreedy:  repetition prefers fewer, (?U)
+pub rec Flags {
+    fold:      bool;
+    multiline: bool;
+    dotnl:     bool;
+    ungreedy:  bool;
+}
+
+# a range of code points, both ends included
+# ---
+# lo: the first code point
+# hi: the last code point
+pub rec Range {
+    lo: u32;
+    hi: u32;
+}
+
+# a run of entries in one of the Ast's vectors
+# ---
+# start: index of the first entry
+# len:   number of entries
+pub rec Span {
+    start: usize;
+    len:   usize;
+}
+
+# one code point to match
+# ---
+# cp:   the code point
+# fold: it matches in any case
+pub rec Literal {
+    cp:   u32;
+    fold: bool;
+}
+
+# a unicode class named by \p or \P, resolved when the pattern is compiled
+# ---
+# name:    the class name as written, borrowed from the pattern
+# negated: it matches every code point outside the class
+# offset:  where the escape begins in the pattern, for an unknown name
+pub rec Unicode {
+    name:    View;
+    negated: bool;
+    offset:  usize;
+}
+
+# a set of code point ranges within a class
+# ---
+# ranges:  span of the Ast's ranges
+# negated: it stands for every code point outside its ranges
+pub rec Set {
+    ranges:  Span;
+    negated: bool;
+}
+
+# one member of a character class
+#
+# a negated member is folded before it is negated, as RE2 does, so (?i)\W
+# excludes every case variant of a word character.
+# ---
+# set:     ranges given literally or by a perl or posix class
+# unicode: a unicode class
+pub tag Item: u8 {
+    set:     Set;
+    unicode: Unicode;
+}
+
+# a character class
+#
+# it matches the union of its items, folded when fold is set, then
+# complemented when negated is set.
+# ---
+# items:   span of the Ast's items
+# negated: it matches every code point outside the union
+# fold:    letters match in any case
+pub rec Class {
+    items:   Span;
+    negated: bool;
+    fold:    bool;
+}
+
+# a capturing group
+# ---
+# index: its number, counting open parentheses from 1
+# name:  its name, empty for an unnamed group
+# sub:   the node it captures
+pub rec Capture {
+    index: u32;
+    name:  View;
+    sub:   usize;
+}
+
+# a repetition
+# ---
+# sub:    the node repeated
+# min:    the fewest repetitions
+# max:    the most repetitions, UNBOUNDED for no limit
+# greedy: it prefers more repetitions to fewer
+pub rec Repeat {
+    sub:    usize;
+    min:    u32;
+    max:    u32;
+    greedy: bool;
+}
+
+# one node of a parsed pattern
+# ---
+# empty:             matches the empty string
+# literal:           one code point
+# class:             a character class, by index into the Ast's classes
+# any:               any code point, a newline included
+# any_but_newline:   any code point but a newline
+# begin_line:        the start of the text or of a line, ^ under (?m)
+# end_line:          the end of the text or of a line, $ under (?m)
+# begin_text:        the start of the text, ^ or \A
+# end_text:          the end of the text, $ or \z
+# word_boundary:     an ascii word boundary, \b
+# not_word_boundary: not an ascii word boundary, \B
+# capture:           a capturing group
+# repeat:            a repetition
+# concat:            its children in sequence, a span of the Ast's kids
+# alternate:         any one of its children, preferring earlier ones
+pub tag Node: u8 {
+    empty;
+    literal: Literal;
+    class:   usize;
+    any;
+    any_but_newline;
+    begin_line;
+    end_line;
+    begin_text;
+    end_text;
+    word_boundary;
+    not_word_boundary;
+    capture:   Capture;
+    repeat:    Repeat;
+    concat:    Span;
+    alternate: Span;
+}
+
+# a parsed pattern
+# ---
+# nodes:   every node, the root among them
+# kids:    the children of concatenations and alternations
+# classes: every character class
+# items:   the members of every class
+# ranges:  the ranges of every set
+# names:   each group's name by index, empty for unnamed and for index 0
+# root:    the index of the root node
+pub rec Ast {
+    nodes:   Vector[Node];
+    kids:    Vector[usize];
+    classes: Vector[Class];
+    items:   Vector[Item];
+    ranges:  Vector[Range];
+    names:   Vector[View];
+    root:    usize;
+}
+
+# an empty Ast drawing on an allocator
+# ---
+# a:   the allocator its vectors grow in
+# ret: the Ast, owning nothing until it grows
+pub fun init(a: *A.Allocator) Ast {
+    ret Ast{
+        nodes:   vector.init[Node](a),
+        kids:    vector.init[usize](a),
+        classes: vector.init[Class](a),
+        items:   vector.init[Item](a),
+        ranges:  vector.init[Range](a),
+        names:   vector.init[View](a),
+        root:    0,
+    };
+}
+
+# release everything an Ast holds
+# ---
+# ast: the Ast to release
+pub fun dnit(ast: *Ast) {
+    vector.dnit[Node](?ast.nodes);
+    vector.dnit[usize](?ast.kids);
+    vector.dnit[Class](?ast.classes);
+    vector.dnit[Item](?ast.items);
+    vector.dnit[Range](?ast.ranges);
+    vector.dnit[View](?ast.names);
+}
+
+# the number of capturing groups, not counting the whole match
+# ---
+# ast: the parsed pattern
+# ret: how many groups it captures
+pub fun groups(ast: *Ast) usize {
+    if (ast.names.len == 0) { ret 0; }
+    ret ast.names.len - 1;
+}
