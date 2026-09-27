@@ -40,6 +40,23 @@ targets = ["*"]
 link = []
 need = []
 
+# a rebar runner, for benchmarking against other engines with rebar
+[artifact.rebar]
+kind = "bin"
+entry = "bin/rebar.mach"
+out = "bin/rebar{artifact.suffix}"
+targets = ["*"]
+link = ["kernel32"]
+need = []
+
+[link.kernel32]
+source = "system"
+name = "kernel32.dll"
+os = ["windows"]
+isa = ["*"]
+abi = ["*"]
+export = false
+
 [profile.debug]
 default = true
 opt = 0
