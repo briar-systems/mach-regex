@@ -6,5 +6,6 @@ use std.runtime;
 
 use regex.lib.regex;
 
+use compile_tests: regex.test.compile;
 use syntax_tests:  regex.test.syntax;
 use unicode_tests: regex.test.unicode;
