@@ -1,0 +1,769 @@
+# a lazy dfa: the program's threads determinized as a search needs them
+#
+# a state is the list of instructions threads wait at, in the order the pike vm
+# would rank them, with the context of the byte behind the position where the
+# program's assertions read it, whether new threads may still start, and
+# whether a match ended just before the byte that led to it. the closure of a
+# state is taken only when the next byte is known, so every assertion and the
+# code point boundary where new threads start is decided exactly, and each
+# transition, once computed, is a table lookup by the byte's class.
+#
+# leftmost-first keeps a state's list in priority order and cuts every thread
+# after a match. leftmost-longest separates threads by where they started with
+# marks, and a match cuts the threads that started later, as RE2 does. reading
+# backward, a state is a plain set, and every position where a match can begin
+# is reported.
+#
+# states live in an arena sized from the program when the dfa is made, so a
+# search allocates nothing. a full arena is cleared and the search goes on
+# from the state it was in. one that fills again before the search has read ten
+# bytes for each state it holds gives up, and the caller searches another way.
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use regex.compile;
+use regex.compile.program;
+use regex.compile.program.Assert;
+use regex.compile.program.Inst;
+use regex.compile.program.Prog;
+use regex.exec.pikevm;
+use regex.exec.prefix;
+use regex.syntax;
+
+# no position
+pub val NONE: usize = 0xFFFFFFFFFFFFFFFF;
+
+# the most memory one dfa's arena takes
+pub val BUDGET: usize = 2097152;
+
+# a transition not yet computed, or a state that could not be made
+val UNKNOWN: u32 = 0xFFFFFFFF;
+
+# a list entry separating threads by where they started
+val MARK: u32 = 0xFFFFFFFE;
+
+# a match ended just before the byte that led to the state
+val MATCH: u32 = 1;
+# the byte behind the position is an ascii word byte
+val WORD: u32 = 2;
+# the byte behind the position is a newline
+val NEWLINE: u32 = 4;
+# the position is at the edge of the text, with no byte behind it
+val EDGE: u32 = 8;
+# new threads still start at each code point boundary
+val START: u32 = 16;
+
+# how threads are ranked
+# ---
+# first:   leftmost-first, a match cuts every thread after it
+# longest: leftmost-longest, a match cuts the threads that started after it
+# all:     every match counts and nothing is cut
+pub tag Kind: u8 {
+    first;
+    longest;
+    all;
+}
+
+# what a search found
+# ---
+# none:    no match
+# found:   the position a match ends at reading forward, or begins at reading backward
+# gave_up: the arena filled too often, and the search must be made another way
+pub tag Outcome: u8 {
+    none;
+    found: usize;
+    gave_up;
+}
+
+# a lazy dfa for one program, and the scratch it searches in
+# ---
+# kind:     how threads are ranked
+# backward: the program reads the text right to left
+# stride:   transitions per state, one per byte class and one for the edge of the text
+# need:     the context flags the program's assertions read
+# cap:      the most states the arena holds
+# count:    states in use
+# trans:    each state's row of transitions, UNKNOWN where not yet computed
+# lists:    where each state's list begins in the pool
+# lens:     each state's list length
+# flags:    each state's flags
+# hashes:   each state's hash
+# pool:     the states' lists
+# used:     pool entries in use
+# table:    states by hash, open addressed, a state's index plus one or 0 for none
+# starts:   the start state for each context, UNKNOWN until made
+# q:        the closure being taken, every instruction reached in order, with marks
+# qlen:     entries in q
+# at_q:     where each instruction sits in q, meaningful only for members
+# stack:    the closure's pending instructions
+# out:      the list of the state a transition leads to
+# olen:     entries in out
+# at_out:   where each instruction sits in out, meaningful only for members
+# held:     the list of the current state, kept across a clearing
+# cleared:  whether the arena has been cleared in this search
+# since:    where the search was when it last cleared the arena
+pub rec Dfa {
+    kind:     Kind;
+    backward: bool;
+    stride:   usize;
+    need:     u32;
+    cap:      usize;
+    count:    usize;
+    trans:    Vector[u32];
+    lists:    Vector[u32];
+    lens:     Vector[u32];
+    flags:    Vector[u32];
+    hashes:   Vector[u32];
+    pool:     Vector[u32];
+    used:     usize;
+    table:    Vector[u32];
+    starts:   [32]u32;
+    q:        Vector[u32];
+    qlen:     usize;
+    at_q:     Vector[u32];
+    stack:    Vector[u32];
+    out:      Vector[u32];
+    olen:     usize;
+    at_out:   Vector[u32];
+    held:     Vector[u32];
+    cleared:  bool;
+    since:    usize;
+}
+
+# grow a vector to n zeroed elements
+fun sized[T](v: *Vector[T], n: usize) bool {
+    val grown: res[usize, A.Error] = vector.ensure[T](v, n);
+    if (sel grown.err) { ret false; }
+    var zero: T;
+    var k:    usize = 0;
+    for (k < n) {
+        v.data[k] = zero;
+        k         = k + 1;
+    }
+    v.len = n;
+    ret true;
+}
+
+# the context flags the program's assertions read
+fun needed(p: *Prog, backward: bool) u32 {
+    var need: u32   = 0;
+    var k:    usize = 0;
+    for (k < p.insts.len) {
+        val i: Inst = p.insts.data[k];
+        if (sel i.look) {
+            val a: Assert = i.look.assert;
+            if (sel a.word_boundary || sel a.not_word_boundary) { need = need | WORD; }
+            # the state holds the side of the position already read
+            if (!backward && sel a.begin_line) { need = need | NEWLINE | EDGE; }
+            if (!backward && sel a.begin_text) { need = need | EDGE; }
+            if (backward && sel a.end_line)    { need = need | NEWLINE | EDGE; }
+            if (backward && sel a.end_text)    { need = need | EDGE; }
+        }
+        k = k + 1;
+    }
+    ret need;
+}
+
+# make a lazy dfa for a program
+# ---
+# a:        the allocator the arena and scratch live in
+# p:        the program
+# kind:     how threads are ranked
+# backward: the program reads the text right to left
+# d:        the dfa to fill
+# ret:      false when the allocator refuses, leaving nothing held
+pub fun init(a: *A.Allocator, p: *Prog, kind: Kind, backward: bool, d: *Dfa) bool {
+    val size: usize = p.insts.len;
+    d.kind     = kind;
+    d.backward = backward;
+    d.stride   = p.class_count::usize + 1;
+    d.need     = needed(p, backward);
+    # a state takes its row, its bookkeeping, its table slots and a share of the pool
+    val each: usize = d.stride * 4 + 16 + 8 + 32;
+    d.cap = size * 4;
+    if (d.cap < 64)            { d.cap = 64; }
+    if (d.cap > BUDGET / each) { d.cap = BUDGET / each; }
+    var slots: usize = 1;
+    for (slots < d.cap * 2) { slots = slots * 2; }
+    d.count   = 0;
+    d.used    = 0;
+    d.qlen    = 0;
+    d.olen    = 0;
+    d.cleared = false;
+    d.since   = 0;
+    d.trans   = vector.init[u32](a);
+    d.lists   = vector.init[u32](a);
+    d.lens    = vector.init[u32](a);
+    d.flags   = vector.init[u32](a);
+    d.hashes  = vector.init[u32](a);
+    d.pool    = vector.init[u32](a);
+    d.table   = vector.init[u32](a);
+    d.q       = vector.init[u32](a);
+    d.at_q    = vector.init[u32](a);
+    d.stack   = vector.init[u32](a);
+    d.out     = vector.init[u32](a);
+    d.at_out  = vector.init[u32](a);
+    d.held    = vector.init[u32](a);
+    # a list holds each instruction at most once and at most one mark after each
+    val list: usize = size * 2 + 2;
+    var ok:   bool  = sized[u32](?d.trans, d.cap * d.stride);
+    ok = sized[u32](?d.lists, d.cap) && ok;
+    ok = sized[u32](?d.lens, d.cap) && ok;
+    ok = sized[u32](?d.flags, d.cap) && ok;
+    ok = sized[u32](?d.hashes, d.cap) && ok;
+    ok = sized[u32](?d.pool, d.cap * 8 + list * 2) && ok;
+    ok = sized[u32](?d.table, slots) && ok;
+    ok = sized[u32](?d.q, list) && ok;
+    ok = sized[u32](?d.at_q, size) && ok;
+    ok = sized[u32](?d.stack, size + 1) && ok;
+    ok = sized[u32](?d.out, list) && ok;
+    ok = sized[u32](?d.at_out, size) && ok;
+    ok = sized[u32](?d.held, list) && ok;
+    if (!ok) {
+        dnit(d);
+        ret false;
+    }
+    clear(d);
+    ret true;
+}
+
+# release a dfa's arena and scratch
+# ---
+# d: the dfa
+pub fun dnit(d: *Dfa) {
+    vector.dnit[u32](?d.trans);
+    vector.dnit[u32](?d.lists);
+    vector.dnit[u32](?d.lens);
+    vector.dnit[u32](?d.flags);
+    vector.dnit[u32](?d.hashes);
+    vector.dnit[u32](?d.pool);
+    vector.dnit[u32](?d.table);
+    vector.dnit[u32](?d.q);
+    vector.dnit[u32](?d.at_q);
+    vector.dnit[u32](?d.stack);
+    vector.dnit[u32](?d.out);
+    vector.dnit[u32](?d.at_out);
+    vector.dnit[u32](?d.held);
+}
+
+# forget every state
+fun clear(d: *Dfa) {
+    d.count = 0;
+    d.used  = 0;
+    var k: usize = 0;
+    for (k < d.table.len) {
+        d.table.data[k] = 0;
+        k               = k + 1;
+    }
+    k = 0;
+    for (k < 32) {
+        d.starts[k] = UNKNOWN;
+        k           = k + 1;
+    }
+}
+
+fun hash(list: *u32, len: usize, flags: u32) u32 {
+    var h: u32   = 2166136261 ^ flags;
+    var k: usize = 0;
+    for (k < len) {
+        h = (h ^ list[k]) * 16777619;
+        k = k + 1;
+    }
+    ret h;
+}
+
+# the state with this list and these flags, made if it is new, or UNKNOWN when
+# the arena has no room for it
+fun intern(d: *Dfa, list: *u32, len: usize, flags: u32) u32 {
+    val h:    u32   = hash(list, len, flags);
+    val mask: usize = d.table.len - 1;
+    var at:   usize = h::usize & mask;
+    for {
+        val e: u32 = d.table.data[at];
+        if (e == 0) { brk; }
+        val s: usize = (e - 1)::usize;
+        if (d.hashes.data[s] == h && d.flags.data[s] == flags && d.lens.data[s]::usize == len) {
+            val start: usize = d.lists.data[s]::usize;
+            var k:     usize = 0;
+            for (k < len && d.pool.data[start + k] == list[k]) { k = k + 1; }
+            if (k == len) { ret s::u32; }
+        }
+        at = (at + 1) & mask;
+    }
+    if (d.count >= d.cap || d.used + len > d.pool.len) { ret UNKNOWN; }
+    val s: usize = d.count;
+    var k: usize = 0;
+    for (k < len) {
+        d.pool.data[d.used + k] = list[k];
+        k                       = k + 1;
+    }
+    d.lists.data[s]  = d.used::u32;
+    d.lens.data[s]   = len::u32;
+    d.flags.data[s]  = flags;
+    d.hashes.data[s] = h;
+    k                = 0;
+    for (k < d.stride) {
+        d.trans.data[s * d.stride + k] = UNKNOWN;
+        k                              = k + 1;
+    }
+    d.table.data[at] = (s + 1)::u32;
+    d.used           = d.used + len;
+    d.count          = s + 1;
+    ret s::u32;
+}
+
+fun is_word(b: u8) bool {
+    ret (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_';
+}
+
+# the context flags of a byte behind a position
+fun behind(d: *Dfa, b: u8) u32 {
+    var f: u32 = 0;
+    if (is_word(b)) { f = f | WORD; }
+    if (b == '\n')  { f = f | NEWLINE; }
+    ret f & d.need;
+}
+
+# which assertions hold at a position, as bits, between the side a state has
+# read and the side a transition reads next, a byte or the edge of the text
+fun looks(d: *Dfa, flags: u32, edge: bool, b: u8) u8 {
+    var read: u32 = flags;
+    var next: u32 = EDGE;
+    if (!edge) {
+        next = 0;
+        if (is_word(b)) { next = next | WORD; }
+        if (b == '\n')  { next = next | NEWLINE; }
+    }
+    var left:  u32 = read;
+    var right: u32 = next;
+    if (d.backward) {
+        left  = next;
+        right = read;
+    }
+    var bits: u8 = 0;
+    if ((left & (EDGE | NEWLINE)) != 0)                { bits = bits | 1; }
+    if ((right & (EDGE | NEWLINE)) != 0)               { bits = bits | 2; }
+    if ((left & EDGE) != 0)                            { bits = bits | 4; }
+    if ((right & EDGE) != 0)                           { bits = bits | 8; }
+    if (((left & WORD) != 0) != ((right & WORD) != 0)) { bits = bits | 16; }
+    or                                                 { bits = bits | 32; }
+    ret bits;
+}
+
+fun holds(a: Assert, bits: u8) bool {
+    if (sel a.begin_line)    { ret (bits & 1) != 0; }
+    if (sel a.end_line)      { ret (bits & 2) != 0; }
+    if (sel a.begin_text)    { ret (bits & 4) != 0; }
+    if (sel a.end_text)      { ret (bits & 8) != 0; }
+    if (sel a.word_boundary) { ret (bits & 16) != 0; }
+    ret (bits & 32) != 0;
+}
+
+fun in_q(d: *Dfa, pc: u32) bool {
+    val at: u32 = d.at_q.data[pc];
+    ret at::usize < d.qlen && d.q.data[at] == pc;
+}
+
+fun put_q(d: *Dfa, pc: u32) {
+    if (pc != MARK) { d.at_q.data[pc] = d.qlen::u32; }
+    d.q.data[d.qlen] = pc;
+    d.qlen           = d.qlen + 1;
+}
+
+# a mark before the next group, unless the group before it is empty
+fun mark_q(d: *Dfa) {
+    if (d.qlen > 0 && d.q.data[d.qlen - 1] != MARK) { put_q(d, MARK); }
+}
+
+# follow an instruction's empty-width closure into q, in priority order
+#
+# leftmost-first stops at a match, which cuts the threads it has not reached.
+# ret: whether a match was reached
+fun follow(d: *Dfa, p: *Prog, from: u32, bits: u8) bool {
+    var depth:   usize = 1;
+    var matched: bool  = false;
+    d.stack.data[0] = from;
+    for (depth > 0) {
+        depth = depth - 1;
+        var pc: u32 = d.stack.data[depth];
+        for {
+            if (in_q(d, pc)) { brk; }
+            put_q(d, pc);
+            val i: Inst = p.insts.data[pc];
+            if (sel i.split) {
+                d.stack.data[depth] = i.split.y;
+                depth               = depth + 1;
+                pc                  = i.split.x;
+                cnt;
+            }
+            if (sel i.save) {
+                pc = i.save.next;
+                cnt;
+            }
+            if (sel i.look) {
+                if (!holds(i.look.assert, bits)) { brk; }
+                pc = i.look.next;
+                cnt;
+            }
+            if (sel i.match) {
+                matched = true;
+                if (sel d.kind.first) { ret true; }
+            }
+            brk;
+        }
+    }
+    ret matched;
+}
+
+# take a state's closure at a position whose assertions are known into q
+#
+# boundary says whether new threads may start here, which only a forward
+# unanchored search asks. keep says whether they may start at later positions.
+# ret: whether a match ends here
+fun expand(d: *Dfa, p: *Prog, s: u32, bits: u8, boundary: bool, keep: *bool) bool {
+    d.qlen = 0;
+    val flags:   u32   = d.flags.data[s];
+    val start:   usize = d.lists.data[s]::usize;
+    val len:     usize = d.lens.data[s]::usize;
+    var matched: bool  = false;
+    var cut:     bool  = false;
+    var k:       usize = 0;
+    for (k < len) {
+        val e: u32 = d.pool.data[start + k];
+        k = k + 1;
+        if (e == MARK) {
+            # a match cuts the threads that started after its own
+            if (matched && sel d.kind.longest) {
+                cut = true;
+                brk;
+            }
+            mark_q(d);
+            cnt;
+        }
+        if (follow(d, p, e, bits)) {
+            matched = true;
+            if (sel d.kind.first) {
+                cut = true;
+                brk;
+            }
+        }
+    }
+    @keep = (flags & START) != 0 && !matched;
+    if (!cut && !matched && boundary && (flags & START) != 0) {
+        if (sel d.kind.longest) { mark_q(d); }
+        if (follow(d, p, p.start, bits)) {
+            matched = true;
+            @keep   = false;
+        }
+    }
+    ret matched;
+}
+
+fun in_out(d: *Dfa, pc: u32) bool {
+    val at: u32 = d.at_out.data[pc];
+    ret at::usize < d.olen && d.out.data[at] == pc;
+}
+
+fun put_out(d: *Dfa, pc: u32) {
+    if (pc != MARK) { d.at_out.data[pc] = d.olen::u32; }
+    d.out.data[d.olen] = pc;
+    d.olen             = d.olen + 1;
+}
+
+# the threads of q that read a byte, where it takes them, into out
+#
+# a thread reached earlier keeps its place, and in leftmost-longest each
+# group is sorted, since its threads share a start and their order means
+# nothing.
+fun advance(d: *Dfa, p: *Prog, b: u8) {
+    d.olen = 0;
+    var k: usize = 0;
+    for (k < d.qlen) {
+        val pc: u32 = d.q.data[k];
+        k = k + 1;
+        if (pc == MARK) {
+            if (d.olen > 0 && d.out.data[d.olen - 1] != MARK) { put_out(d, MARK); }
+            cnt;
+        }
+        var next: u32 = 0;
+        if (program.step(p, p.insts.data[pc], b, ?next) && !in_out(d, next)) { put_out(d, next); }
+    }
+    if (d.olen > 0 && d.out.data[d.olen - 1] == MARK) { d.olen = d.olen - 1; }
+    if (!(sel d.kind.longest))                        { ret; }
+    var group: usize = 0;
+    for (group < d.olen) {
+        var end: usize = group;
+        for (end < d.olen && d.out.data[end] != MARK) { end = end + 1; }
+        var i: usize = group + 1;
+        for (i < end) {
+            val v: u32   = d.out.data[i];
+            var j: usize = i;
+            for (j > group && d.out.data[j - 1] > v) {
+                d.out.data[j] = d.out.data[j - 1];
+                j             = j - 1;
+            }
+            d.out.data[j] = v;
+            i             = i + 1;
+        }
+        group = end + 1;
+    }
+}
+
+# the transition from s on a byte class, computing and keeping it
+#
+# edge says the transition reads the edge of the text rather than b. when the
+# arena is full it is cleared and s made again, which is why s is a place.
+# ret: the state it leads to, or UNKNOWN to give up
+fun transition(d: *Dfa, p: *Prog, s: *u32, class: usize, b: u8, edge: bool, at: usize) u32 {
+    var keep:    bool = false;
+    val bits:    u8   = looks(d, d.flags.data[@s], edge, b);
+    val forward: bool = !d.backward;
+    val matched: bool = expand(d, p, @s, bits, forward && (edge || (b & 0xC0) != 0x80), ?keep);
+    var flags:   u32  = 0;
+    if (matched) { flags = MATCH; }
+    d.olen = 0;
+    if (!edge) {
+        advance(d, p, b);
+        flags = flags | behind(d, b);
+        if (keep) { flags = flags | START; }
+    }
+    var t: u32 = intern(d, ?d.out.data[0], d.olen, flags);
+    if (t == UNKNOWN) {
+        # clearing twice without reading ten bytes a state means the arena thrashes
+        var distance: usize = at - d.since;
+        if (d.since > at)                       { distance = d.since - at; }
+        if (d.cleared && distance < d.cap * 10) { ret UNKNOWN; }
+        val len:   usize = d.lens.data[@s]::usize;
+        val from:  usize = d.lists.data[@s]::usize;
+        val state: u32   = d.flags.data[@s];
+        var k:     usize = 0;
+        for (k < len) {
+            d.held.data[k] = d.pool.data[from + k];
+            k              = k + 1;
+        }
+        clear(d);
+        d.cleared = true;
+        d.since   = at;
+        @s        = intern(d, ?d.held.data[0], len, state);
+        if (@s == UNKNOWN) { ret UNKNOWN; }
+        t = intern(d, ?d.out.data[0], d.olen, flags);
+        if (t == UNKNOWN) { ret UNKNOWN; }
+    }
+    d.trans.data[(@s)::usize * d.stride + class] = t;
+    ret t;
+}
+
+# the state a search starts in, given the context of the byte behind it
+fun start(d: *Dfa, p: *Prog, context: u32, anchored: bool) u32 {
+    var flags: u32 = context & d.need;
+    if (!anchored)                  { flags = flags | START; }
+    if (d.starts[flags] != UNKNOWN) { ret d.starts[flags]; }
+    var list: [1]u32 = [1]u32{p.start};
+    var len:  usize  = 0;
+    if (anchored) { len = 1; }
+    var s: u32 = intern(d, ?list[0], len, flags);
+    if (s == UNKNOWN) {
+        clear(d);
+        s = intern(d, ?list[0], len, flags);
+        if (s == UNKNOWN) { ret UNKNOWN; }
+    }
+    d.starts[flags] = s;
+    ret s;
+}
+
+# the context of a text's byte at, or its edge
+fun context_at(d: *Dfa, text: View, at: usize, edge: bool) u32 {
+    if (edge) { ret EDGE & d.need; }
+    ret behind(d, text.data[at]);
+}
+
+# whether no thread is left and none can start
+fun dead(d: *Dfa, s: u32) bool {
+    ret d.lens.data[s] == 0 && (d.flags.data[s] & START) == 0;
+}
+
+# search forward for where the leftmost match ends
+# ---
+# d:        a forward dfa for the program
+# p:        the program
+# text:     the text
+# from:     where matches may begin, a code point boundary
+# earliest: stop at the first match found, for a search that asks only whether one exists
+# ret:      the end of the leftmost match, none, or gave_up
+pub fun forward(d: *Dfa, p: *Prog, text: View, from: usize, earliest: bool) Outcome {
+    d.cleared = false;
+    d.since   = from;
+    var s:    u32   = start(d, p, context_at(d, text, from - 1, from == 0), false);
+    var last: usize = NONE;
+    var at:   usize = from;
+    if (s == UNKNOWN) { ret Outcome.gave_up{}; }
+    for {
+        # with no thread alive, no match can begin before the prefix's next occurrence
+        if (p.prefix_len > 0 && d.lens.data[s] == 0 && (d.flags.data[s] & START) != 0) {
+            var next: usize = 0;
+            if (!prefix.candidate(p, text, at, ?next)) { brk; }
+            if (next != at) {
+                at = next;
+                s  = start(d, p, context_at(d, text, at - 1, false), false);
+                if (s == UNKNOWN) { ret Outcome.gave_up{}; }
+            }
+        }
+        if (at >= text.len) {
+            var t: u32 = d.trans.data[s::usize * d.stride + d.stride - 1];
+            if (t == UNKNOWN)                   { t = transition(d, p, ?s, d.stride - 1, 0, true, at); }
+            if (t == UNKNOWN)                   { ret Outcome.gave_up{}; }
+            if ((d.flags.data[t] & MATCH) != 0) { last = at; }
+            brk;
+        }
+        val b:     u8    = text.data[at];
+        val class: usize = p.classes[b]::usize;
+        var t:     u32   = d.trans.data[s::usize * d.stride + class];
+        if (t == UNKNOWN) { t = transition(d, p, ?s, class, b, false, at); }
+        if (t == UNKNOWN) { ret Outcome.gave_up{}; }
+        if ((d.flags.data[t] & MATCH) != 0) {
+            last = at;
+            if (earliest) { brk; }
+        }
+        if (dead(d, t)) { brk; }
+        s  = t;
+        at = at + 1;
+    }
+    if (last == NONE) { ret Outcome.none{}; }
+    ret Outcome.found{last};
+}
+
+# search backward from where a match ends for the earliest position it can begin
+# ---
+# d:    a backward dfa for the reverse program
+# p:    the reverse program
+# text: the text
+# from: the earliest position a match may begin
+# end:  where the match ends
+# ret:  the earliest start, none, or gave_up
+pub fun backward(d: *Dfa, p: *Prog, text: View, from: usize, end: usize) Outcome {
+    d.cleared = false;
+    d.since   = end;
+    var s:    u32   = start(d, p, context_at(d, text, end, end == text.len), true);
+    var last: usize = NONE;
+    var at:   usize = end;
+    if (s == UNKNOWN) { ret Outcome.gave_up{}; }
+    for {
+        if (at == from) {
+            if (at == 0) {
+                var t: u32 = d.trans.data[s::usize * d.stride + d.stride - 1];
+                if (t == UNKNOWN)                   { t = transition(d, p, ?s, d.stride - 1, 0, true, at); }
+                if (t == UNKNOWN)                   { ret Outcome.gave_up{}; }
+                if ((d.flags.data[t] & MATCH) != 0) { last = at; }
+                brk;
+            }
+            # a match may not begin before from, but the byte behind it still decides assertions
+            var keep: bool = false;
+            if (expand(d, p, s, looks(d, d.flags.data[s], false, text.data[at - 1]), false, ?keep)) { last = at; }
+            brk;
+        }
+        val b:     u8    = text.data[at - 1];
+        val class: usize = p.classes[b]::usize;
+        var t:     u32   = d.trans.data[s::usize * d.stride + class];
+        if (t == UNKNOWN)                   { t = transition(d, p, ?s, class, b, false, at); }
+        if (t == UNKNOWN)                   { ret Outcome.gave_up{}; }
+        if ((d.flags.data[t] & MATCH) != 0) { last = at; }
+        if (dead(d, t))                     { brk; }
+        s  = t;
+        at = at - 1;
+    }
+    if (last == NONE) { ret Outcome.none{}; }
+    ret Outcome.found{last};
+}
+
+# a program, its dfa and a pike vm to check it against, over the testing allocator
+rec Fixture {
+    t:    testing.Testing;
+    tree: syntax.Ast;
+    p:    Prog;
+    d:    Dfa;
+    vm:   pikevm.Cache;
+    ok:   bool;
+}
+
+#[testing]
+fun open(f: *Fixture, pattern: str) {
+    testing.make(?f.t);
+    val a:     *A.Allocator                  = testing.allocator_of(?f.t);
+    var flags: syntax.Flags;
+    val tree:  res[syntax.Ast, syntax.Error] = syntax.parse(a, view(pattern, str_len(pattern)), flags, false);
+    f.ok = false;
+    if (sel tree.err) { ret; }
+    f.tree = tree.ok;
+    val p: res[Prog, syntax.Error] = compile.compile(a, ?f.tree);
+    if (sel p.err) {
+        syntax.dnit(?f.tree);
+        ret;
+    }
+    f.p = p.ok;
+    if (!init(a, ?f.p, Kind.first{}, false, ?f.d)) {
+        program.dnit(?f.p);
+        syntax.dnit(?f.tree);
+        ret;
+    }
+    if (!pikevm.init(a, ?f.p, ?f.vm)) {
+        dnit(?f.d);
+        program.dnit(?f.p);
+        syntax.dnit(?f.tree);
+        ret;
+    }
+    f.ok = true;
+}
+
+#[testing]
+fun close(f: *Fixture) bool {
+    if (f.ok) {
+        pikevm.dnit(?f.vm);
+        dnit(?f.d);
+        program.dnit(?f.p);
+        syntax.dnit(?f.tree);
+    }
+    val clean: bool = !testing.leaked(?f.t);
+    testing.dnit(?f.t);
+    ret clean;
+}
+
+# the (a|b)*a(a|b){6} family needs a state for every arrangement of the last seven bytes
+test forward__clears_a_full_arena_and_goes_on {
+    var f: Fixture;
+    open(?f, "(a|b)*a(a|b){6}");
+    if (!f.ok) { ret 1; }
+    var text: [60]u8;
+    var x:    u32   = 1;
+    var k:    usize = 0;
+    for (k < 60) {
+        x       = x * 1103515245 + 12345;
+        text[k] = 'a' + ((x >> 16) & 1)::u8;
+        k       = k + 1;
+    }
+    val v:    View = view(?text[0], 60);
+    var want: [2]usize;
+    if (!pikevm.search(?f.p, ?f.vm, v, 0, false, false, 2, ?want[0])) { ret 2; }
+    f.d.cap = 36;
+    val o: Outcome = forward(?f.d, ?f.p, v, 0, false);
+    if (!f.d.cleared)                         { ret 3; }
+    if (!(sel o.found && o.found == want[1])) { ret 4; }
+    # an arena too small for the text's states fills again at once, and the search gives up
+    clear(?f.d);
+    f.d.cap = 8;
+    val thrash: Outcome = forward(?f.d, ?f.p, v, 0, false);
+    if (!(sel thrash.gave_up)) { ret 5; }
+    if (!close(?f))            { ret 6; }
+    ret 0;
+}
