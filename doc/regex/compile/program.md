@@ -145,6 +145,8 @@ prefix: bytes every match begins with, the first prefix_len of them
 prefix_len: how many bytes of prefix are required, 0 for none
 firsts: the bytes every match begins with one of, the first first_count of them
 first_count: how many, 1 to 16, or 0 when there are more or a match can begin without a byte
+inner: a literal every match contains, the first inner_len bytes, kept only when no match can span a newline
+inner_len: how many bytes of inner there are, 0 for none
 classes: each byte's class. the program never tells two bytes of a class apart
 class_count: how many classes there are
 
