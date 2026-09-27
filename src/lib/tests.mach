@@ -5,3 +5,5 @@
 use std.runtime;
 
 use regex.lib.regex;
+
+use unicode_tests: regex.test.unicode;
