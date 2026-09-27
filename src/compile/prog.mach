@@ -1,0 +1,133 @@
+# a compiled program: instructions over bytes with explicit successors
+#
+# the contract every matching engine runs on. an instruction names the
+# instructions that follow it, so a program is a graph in a flat vector, and
+# a thread is an instruction index with its capture slots. code points are
+# utf-8 byte sequences here, so every position is a byte offset.
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.size.usize;
+
+# an empty-width assertion
+# ---
+# begin_line:        at the start of the text or just after a newline
+# end_line:          at the end of the text or just before a newline
+# begin_text:        at the start of the text
+# end_text:          at the end of the text
+# word_boundary:     between an ascii word byte and a byte that is not one
+# not_word_boundary: not at an ascii word boundary
+pub tag Assert: u8 {
+    begin_line;
+    end_line;
+    begin_text;
+    end_text;
+    word_boundary;
+    not_word_boundary;
+}
+
+# a byte range and where a byte in it leads
+# ---
+# lo:   the first byte
+# hi:   the last byte
+# next: the instruction after a byte in the range
+pub rec Trans {
+    lo:   u8;
+    hi:   u8;
+    next: u32;
+}
+
+# two ways on, the first preferred
+# ---
+# x: the preferred successor
+# y: the alternative
+pub rec Split {
+    x: u32;
+    y: u32;
+}
+
+# record the position in a capture slot
+# ---
+# slot: the slot, 2n for group n's start and 2n+1 for its end
+# next: the instruction after
+pub rec Save {
+    slot: u32;
+    next: u32;
+}
+
+# test an empty-width assertion
+# ---
+# assert: the assertion
+# next:   the instruction after, when it holds
+pub rec Look {
+    assert: Assert;
+    next:   u32;
+}
+
+# a run of the program's transitions, sorted and disjoint
+# ---
+# start: index of the first transition
+# len:   number of transitions
+pub rec Sparse {
+    start: u32;
+    len:   u32;
+}
+
+# one instruction
+#
+# a zeroed instruction is fail, so an unfilled slot never matches.
+# ---
+# fail:   never matches
+# match:  a match ends here
+# range:  one byte in a range, then its next
+# sparse: one byte in any of several ranges, each with its own next
+# split:  either successor, the first preferred
+# save:   record the position in a capture slot
+# look:   an empty-width assertion
+pub tag Inst: u8 {
+    fail;
+    match;
+    range:  Trans;
+    sparse: Sparse;
+    split:  Split;
+    save:   Save;
+    look:   Look;
+}
+
+# a compiled program
+# ---
+# insts: the instructions
+# trans: the transitions of every sparse instruction
+# start: the first instruction
+# slots: the number of capture slots, two per group and two for the whole match
+pub rec Prog {
+    insts: Vector[Inst];
+    trans: Vector[Trans];
+    start: u32;
+    slots: u32;
+}
+
+# an empty program drawing on an allocator
+# ---
+# a:   the allocator its vectors grow in
+# ret: the program, owning nothing until it grows
+pub fun init(a: *A.Allocator) Prog {
+    ret Prog{insts: vector.init[Inst](a), trans: vector.init[Trans](a), start: 0, slots: 0};
+}
+
+# release everything a program holds
+# ---
+# p: the program to release
+pub fun dnit(p: *Prog) {
+    vector.dnit[Inst](?p.insts);
+    vector.dnit[Trans](?p.trans);
+}
+
+# the number of instructions
+# ---
+# p:   the program
+# ret: how many instructions it holds
+pub fun size(p: *Prog) usize {
+    ret p.insts.len;
+}
