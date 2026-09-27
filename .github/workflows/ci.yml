@@ -24,8 +24,6 @@ jobs:
     with:
       heavy: ${{ inputs.heavy }}
       mach-version: v6.2.1
-      # mach tests one artifact's closure, and the test modules are reached only by the tests artifact
-      test-selections: '[["--lib", "tests"]]'
       # every demo is its own project, built against this checkout
       subprojects: '[{"path": "demo/*", "build": true, "test": false}]'
 
