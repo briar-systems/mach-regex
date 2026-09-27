@@ -1,5 +1,5 @@
 [project]
-id = "example"
+id = "regex"
 version = "0.1.0"
 mach = "^5.10"
 src = "src"
@@ -30,10 +30,10 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
-[artifact.example]
+[artifact.regex]
 kind = "bin"
 entry = "main.mach"
-out = "bin/example{artifact.suffix}"
+out = "bin/regex{artifact.suffix}"
 targets = ["*"]
 link = ["kernel32"]
 need = []

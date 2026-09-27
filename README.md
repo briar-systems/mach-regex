@@ -1,36 +1,4 @@
-# mach-template
-
-<!-- template -->
-A bone stock [Mach](https://github.com/briar-systems/mach) Hello, World, the
-output of `mach init` with every host target declared, with a GitHub repository
-set up around it: pull request CI on Linux, Windows and macOS, tag-driven
-releases with prebuilt binaries, protected branches, and a label set.
-
-## Using this template
-
-```sh
-gh repo create <owner>/<repo> --template briar-systems/mach-template --public --clone
-cd <repo>
-./setup.sh
-```
-
-`setup.sh` is run-and-delete. It runs once, removes itself in the commit it
-makes, and is never needed again. If it fails partway, fix the cause and run
-it again. It:
-
-- sets the project id to the repository name, minus any leading `mach-` and
-  with dashes turned into underscores. Pass an id to choose another:
-  `./setup.sh <id>`
-- removes this section from the README
-- commits and pushes those changes
-- creates the `main` and `dev` branches and makes `dev` the default
-- allows merge commits only
-- replaces GitHub's stock labels with the set below
-- adds rulesets that protect `main`, `dev` and `v*` tags
-
-It needs `git` and `gh`, logged in with admin rights on the repository.
-Update the copyright holder in `LICENSE` yourself.
-<!-- /template -->
+# mach-regex
 
 ## Build
 
