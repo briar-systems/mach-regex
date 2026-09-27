@@ -1,0 +1,513 @@
+# compile an Ast to a byte program
+#
+# the tree is compiled right to left, each node given its continuation, so a
+# node's instructions are emitted after everything that follows them and name
+# it directly. a class becomes the utf-8 sequences of its code points, built
+# into a trie whose states are sparse instructions, with identical one-range
+# tails shared through a cache. repetition expands to RE2's shapes, and a star
+# over a subexpression that can match empty is compiled as (x+)?, as RE2 does,
+# so the priority order within the loop stays right.
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.map.Map;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use regex.compile.prog;
+use regex.compile.prog.Assert;
+use regex.compile.prog.Inst;
+use regex.compile.prog.Look;
+use regex.compile.prog.Prog;
+use regex.compile.prog.Save;
+use regex.compile.prog.Sparse;
+use regex.compile.prog.Split;
+use regex.compile.prog.Trans;
+use regex.compile.ranges;
+use regex.compile.utf8;
+use regex.compile.utf8.Seq;
+use regex.syntax;
+use regex.syntax.Kind;
+use regex.syntax.Node;
+use regex.syntax.Range;
+use regex.unicode;
+
+# the most instructions a program may hold
+pub val MAX_INSTS: usize = 1048576;
+
+# a trie edge with no child state ends a sequence
+val LEAF: u32 = 0xFFFFFFFF;
+
+# a state of a class's trie
+# ---
+# first: its first edge, LEAF when it has none
+# last:  its last edge
+rec State {
+    first: u32;
+    last:  u32;
+}
+
+# an edge of a class's trie
+# ---
+# lo:     the first byte
+# hi:     the last byte
+# child:  the state it leads to, LEAF at the end of a sequence
+# sib:    the state's next edge, LEAF for the last
+# target: the instruction it compiles to lead to
+rec Edge {
+    lo:     u8;
+    hi:     u8;
+    child:  u32;
+    sib:    u32;
+    target: u32;
+}
+
+# the state of one compilation
+# ---
+# tree:   the Ast
+# prog:   the program being built
+# failed: an error was recorded
+# err:    the first error
+# set:    the code points of the class being compiled
+# part:   one member's code points
+# tmp:    scratch for negation
+# seqs:   the utf-8 sequences of the class
+# states: the trie's states
+# edges:  the trie's edges
+# cache:  one-range instructions by range and successor
+# null:   whether each node can match empty, 0 when not yet known, 1 no, 2 yes
+rec Compiler {
+    tree:   *syntax.Ast;
+    prog:   *Prog;
+    failed: bool;
+    err:    syntax.Error;
+    set:    Vector[Range];
+    part:   Vector[Range];
+    tmp:    Vector[Range];
+    seqs:   Vector[Seq];
+    states: Vector[State];
+    edges:  Vector[Edge];
+    cache:  Map[u64, u32];
+    null:   Vector[u8];
+}
+
+# compile an Ast to a program
+# ---
+# a:    the allocator the program grows in
+# tree: the Ast, whose unicode class names are resolved here
+# ret:  the program, or the first error
+pub fun compile(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
+    var p: Prog     = prog.init(a);
+    var c: Compiler = Compiler{
+        tree:   tree,
+        prog:   ?p,
+        set:    vector.init[Range](a),
+        part:   vector.init[Range](a),
+        tmp:    vector.init[Range](a),
+        seqs:   vector.init[Seq](a),
+        states: vector.init[State](a),
+        edges:  vector.init[Edge](a),
+        cache:  map.init[u64, u32](a),
+        null:   vector.init[u8](a),
+    };
+    fin {
+        vector.dnit[Range](?c.set);
+        vector.dnit[Range](?c.part);
+        vector.dnit[Range](?c.tmp);
+        vector.dnit[Seq](?c.seqs);
+        vector.dnit[State](?c.states);
+        vector.dnit[Edge](?c.edges);
+        map.dnit[u64, u32](?c.cache);
+        vector.dnit[u8](?c.null);
+    }
+
+    var k: usize = 0;
+    for (k < tree.nodes.len) {
+        val pushed: res[usize, A.Error] = vector.push[u8](?c.null, 0);
+        if (sel pushed.err) {
+            fail(?c, Kind.memory{}, 0);
+            brk;
+        }
+        k = k + 1;
+    }
+    val done: u32 = emit(?c, Inst.match{});
+    val end:  u32 = emit(?c, Inst.save{Save{slot: 1, next: done}});
+    val body: u32 = node(?c, tree.root, end);
+    p.start = emit(?c, Inst.save{Save{slot: 0, next: body}});
+    p.slots = (tree.names.len * 2)::u32;
+    if (c.failed) {
+        prog.dnit(?p);
+        ret res[Prog, syntax.Error].err{c.err};
+    }
+    ret res[Prog, syntax.Error].ok{p};
+}
+
+fun fail(c: *Compiler, kind: Kind, offset: usize) {
+    if (c.failed) { ret; }
+    c.failed = true;
+    c.err    = syntax.Error{kind: kind, offset: offset};
+}
+
+# add an instruction, giving its index
+fun emit(c: *Compiler, i: Inst) u32 {
+    if (c.failed) { ret 0; }
+    if (c.prog.insts.len >= MAX_INSTS) {
+        fail(c, Kind.large{}, 0);
+        ret 0;
+    }
+    val pushed: res[usize, A.Error] = vector.push[Inst](?c.prog.insts, i);
+    if (sel pushed.err) {
+        fail(c, Kind.memory{}, 0);
+        ret 0;
+    }
+    ret (c.prog.insts.len - 1)::u32;
+}
+
+# a one-range instruction, shared with any identical one already emitted
+fun range(c: *Compiler, lo: u8, hi: u8, next: u32) u32 {
+    val key: u64       = (lo::u64 << 40) | (hi::u64 << 32) | next::u64;
+    val hit: opt[*u32] = map.get[u64, u32](?c.cache, ?key);
+    if (sel hit.some) { ret @hit.some; }
+    val at: u32 = emit(c, Inst.range{Trans{lo: lo, hi: hi, next: next}});
+    if (c.failed) { ret 0; }
+    val stored: res[bool, A.Error] = map.insert[u64, u32](?c.cache, key, at);
+    if (sel stored.err) { fail(c, Kind.memory{}, 0); }
+    ret at;
+}
+
+# whether a node can match the empty string
+fun nullable(c: *Compiler, i: usize) bool {
+    if (c.null.data[i] != 0) { ret c.null.data[i] == 2; }
+    val n:   Node = c.tree.nodes.data[i];
+    var yes: bool = false;
+    if (sel n.capture) {
+        yes = nullable(c, n.capture.sub);
+    }
+    or (sel n.repeat) {
+        yes = n.repeat.min == 0 || nullable(c, n.repeat.sub);
+    }
+    or (sel n.concat) {
+        yes = true;
+        var k: usize = 0;
+        for (k < n.concat.len && yes) {
+            yes = nullable(c, c.tree.kids.data[n.concat.start + k]);
+            k   = k + 1;
+        }
+    }
+    or (sel n.alternate) {
+        var k: usize = 0;
+        for (k < n.alternate.len && !yes) {
+            yes = nullable(c, c.tree.kids.data[n.alternate.start + k]);
+            k   = k + 1;
+        }
+    }
+    or {
+        yes = sel n.empty || sel n.begin_line || sel n.end_line || sel n.begin_text || sel n.end_text || sel n.word_boundary || sel n.not_word_boundary;
+    }
+    if (yes) { c.null.data[i] = 2; }
+    or       { c.null.data[i] = 1; }
+    ret yes;
+}
+
+# compile a node before its continuation, giving its first instruction
+fun node(c: *Compiler, i: usize, next: u32) u32 {
+    if (c.failed) { ret 0; }
+    val n: Node = c.tree.nodes.data[i];
+    if (sel n.empty)   { ret next; }
+    if (sel n.literal) { ret literal(c, n.literal.cp, n.literal.fold, next); }
+    if (sel n.class)   { ret class(c, c.tree.classes.data[n.class], next); }
+    if (sel n.any) {
+        c.set.len = 0;
+        if (!ranges.append(?c.set, 0, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
+        ret set(c, next);
+    }
+    if (sel n.any_but_newline) {
+        c.set.len = 0;
+        if (!ranges.append(?c.set, 0, 9) || !ranges.append(?c.set, 11, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
+        ret set(c, next);
+    }
+    if (sel n.begin_line)        { ret look(c, Assert.begin_line{}, next); }
+    if (sel n.end_line)          { ret look(c, Assert.end_line{}, next); }
+    if (sel n.begin_text)        { ret look(c, Assert.begin_text{}, next); }
+    if (sel n.end_text)          { ret look(c, Assert.end_text{}, next); }
+    if (sel n.word_boundary)     { ret look(c, Assert.word_boundary{}, next); }
+    if (sel n.not_word_boundary) { ret look(c, Assert.not_word_boundary{}, next); }
+    if (sel n.capture) {
+        val slot: u32 = n.capture.index * 2;
+        val end:  u32 = emit(c, Inst.save{Save{slot: slot + 1, next: next}});
+        val body: u32 = node(c, n.capture.sub, end);
+        ret emit(c, Inst.save{Save{slot: slot, next: body}});
+    }
+    if (sel n.repeat) { ret repeat(c, n.repeat, next); }
+    if (sel n.concat) {
+        var at: u32   = next;
+        var k:  usize = n.concat.len;
+        for (k > 0) {
+            k  = k - 1;
+            at = node(c, c.tree.kids.data[n.concat.start + k], at);
+        }
+        ret at;
+    }
+    if (sel n.alternate) {
+        # compile each alternative to the same continuation, then chain splits in order
+        var at: u32   = node(c, c.tree.kids.data[n.alternate.start + n.alternate.len - 1], next);
+        var k:  usize = n.alternate.len - 1;
+        for (k > 0) {
+            k = k - 1;
+            val first: u32 = node(c, c.tree.kids.data[n.alternate.start + k], next);
+            at = emit(c, Inst.split{Split{x: first, y: at}});
+        }
+        ret at;
+    }
+    ret next;
+}
+
+fun look(c: *Compiler, a: Assert, next: u32) u32 {
+    ret emit(c, Inst.look{Look{assert: a, next: next}});
+}
+
+# a split whose preferred successor depends on greed
+fun choice(c: *Compiler, take: u32, skip: u32, greedy: bool) u32 {
+    if (greedy) { ret emit(c, Inst.split{Split{x: take, y: skip}}); }
+    ret emit(c, Inst.split{Split{x: skip, y: take}});
+}
+
+# overwrite a placeholder split once both successors are known
+fun patch(c: *Compiler, at: u32, take: u32, skip: u32, greedy: bool) {
+    if (c.failed) { ret; }
+    if (greedy)   { c.prog.insts.data[at] = Inst.split{Split{x: take, y: skip}}; }
+    or            { c.prog.insts.data[at] = Inst.split{Split{x: skip, y: take}}; }
+}
+
+# x+ : x, then a choice to loop back or go on
+fun plus(c: *Compiler, sub: usize, greedy: bool, next: u32) u32 {
+    val loop: u32 = emit(c, Inst.fail{});
+    val body: u32 = node(c, sub, loop);
+    patch(c, loop, body, next, greedy);
+    ret body;
+}
+
+# x* : a choice to enter x, which loops back to the choice
+fun star(c: *Compiler, sub: usize, greedy: bool, next: u32) u32 {
+    if (nullable(c, sub)) {
+        # (x+)? keeps the priority order within the loop right, as in RE2
+        ret choice(c, plus(c, sub, greedy, next), next, greedy);
+    }
+    val loop: u32 = emit(c, Inst.fail{});
+    val body: u32 = node(c, sub, loop);
+    patch(c, loop, body, next, greedy);
+    ret loop;
+}
+
+fun repeat(c: *Compiler, r: syntax.Repeat, next: u32) u32 {
+    if (r.max == syntax.UNBOUNDED) {
+        if (r.min == 0) { ret star(c, r.sub, r.greedy, next); }
+        # x{n,} is n-1 copies of x, then x+
+        var at: u32 = plus(c, r.sub, r.greedy, next);
+        var k:  u32 = 1;
+        for (k < r.min) {
+            at = node(c, r.sub, at);
+            k  = k + 1;
+        }
+        ret at;
+    }
+    # x{n,m} is n copies of x, then m-n nested optional copies
+    var at: u32 = next;
+    var k:  u32 = r.min;
+    for (k < r.max) {
+        at = choice(c, node(c, r.sub, at), next, r.greedy);
+        k  = k + 1;
+    }
+    k = 0;
+    for (k < r.min) {
+        at = node(c, r.sub, at);
+        k  = k + 1;
+    }
+    ret at;
+}
+
+fun literal(c: *Compiler, cp: u32, fold: bool, next: u32) u32 {
+    if (fold) {
+        c.set.len = 0;
+        if (!ranges.append(?c.set, cp, cp) || !ranges.fold(?c.set)) {
+            fail(c, Kind.memory{}, 0);
+            ret 0;
+        }
+        ret set(c, next);
+    }
+    var bytes: [4]u8;
+    val n:     u32 = utf8.encode(cp, ?bytes[0]);
+    var at:    u32 = next;
+    var k:     u32 = n;
+    for (k > 0) {
+        k  = k - 1;
+        at = range(c, bytes[k], bytes[k], at);
+    }
+    ret at;
+}
+
+# gather a class's code points into the set
+fun class(c: *Compiler, cls: syntax.Class, next: u32) u32 {
+    c.set.len = 0;
+    var k: usize = 0;
+    for (k < cls.items.len) {
+        val item:    syntax.Item = c.tree.items.data[cls.items.start + k];
+        var negated: bool        = false;
+        c.part.len = 0;
+        if (sel item.unicode) {
+            val t: opt[unicode.Table] = unicode.class(item.unicode.name);
+            if (sel t.none) {
+                fail(c, Kind.invalid_char_range{}, item.unicode.offset);
+                ret 0;
+            }
+            if (!ranges.append_table(?c.part, t.some)) {
+                fail(c, Kind.memory{}, 0);
+                ret 0;
+            }
+            negated = item.unicode.negated;
+        }
+        or (sel item.set) {
+            var r: usize = 0;
+            for (r < item.set.ranges.len) {
+                val given: Range = c.tree.ranges.data[item.set.ranges.start + r];
+                if (!ranges.append(?c.part, given.lo, given.hi)) {
+                    fail(c, Kind.memory{}, 0);
+                    ret 0;
+                }
+                r = r + 1;
+            }
+            negated = item.set.negated;
+        }
+        ranges.canonical(?c.part);
+        # a negated member folds before it negates, as in RE2
+        if (cls.fold && !ranges.fold(?c.part)) {
+            fail(c, Kind.memory{}, 0);
+            ret 0;
+        }
+        if (negated && !ranges.negate(?c.part, ?c.tmp)) {
+            fail(c, Kind.memory{}, 0);
+            ret 0;
+        }
+        var r: usize = 0;
+        for (r < c.part.len) {
+            if (!ranges.append(?c.set, c.part.data[r].lo, c.part.data[r].hi)) {
+                fail(c, Kind.memory{}, 0);
+                ret 0;
+            }
+            r = r + 1;
+        }
+        k = k + 1;
+    }
+    ranges.canonical(?c.set);
+    if (cls.negated && !ranges.negate(?c.set, ?c.tmp)) {
+        fail(c, Kind.memory{}, 0);
+        ret 0;
+    }
+    ret set(c, next);
+}
+
+# compile the set of code points in c.set to its utf-8 automaton
+fun set(c: *Compiler, next: u32) u32 {
+    if (c.failed) { ret 0; }
+    c.seqs.len = 0;
+    var k: usize = 0;
+    for (k < c.set.len) {
+        if (!utf8.sequences(c.set.data[k].lo, c.set.data[k].hi, ?c.seqs)) {
+            fail(c, Kind.memory{}, 0);
+            ret 0;
+        }
+        k = k + 1;
+    }
+    if (c.seqs.len == 0) { ret emit(c, Inst.fail{}); }
+    c.states.len = 0;
+    c.edges.len  = 0;
+    if (!state(c)) { ret 0; }
+    k = 0;
+    for (k < c.seqs.len) {
+        if (!insert(c, c.seqs.data[k])) { ret 0; }
+        k = k + 1;
+    }
+    ret build(c, 0, next);
+}
+
+# a new empty trie state, giving false when the allocator refuses
+fun state(c: *Compiler) bool {
+    val pushed: res[usize, A.Error] = vector.push[State](?c.states, State{first: LEAF, last: LEAF});
+    if (sel pushed.err) {
+        fail(c, Kind.memory{}, 0);
+        ret false;
+    }
+    ret true;
+}
+
+# add a sequence to the trie, sharing a prefix with the sequence before it
+#
+# the sequences arrive in byte order and are disjoint, so only a state's last
+# edge can share a range with the next one.
+fun insert(c: *Compiler, s: Seq) bool {
+    var at: u32 = 0;
+    var d:  u32 = 0;
+    for (d < s.len) {
+        val lo:   u8   = s.lo[d];
+        val hi:   u8   = s.hi[d];
+        val end:  bool = d + 1 == s.len;
+        val last: u32  = c.states.data[at].last;
+        if (last != LEAF && !end && c.edges.data[last].lo == lo && c.edges.data[last].hi == hi && c.edges.data[last].child != LEAF) {
+            at = c.edges.data[last].child;
+            d  = d + 1;
+            cnt;
+        }
+        var child: u32 = LEAF;
+        if (!end) {
+            if (!state(c)) { ret false; }
+            child = (c.states.len - 1)::u32;
+        }
+        val pushed: res[usize, A.Error] = vector.push[Edge](?c.edges, Edge{lo: lo, hi: hi, child: child, sib: LEAF, target: 0});
+        if (sel pushed.err) {
+            fail(c, Kind.memory{}, 0);
+            ret false;
+        }
+        val e: u32 = (c.edges.len - 1)::u32;
+        if (last == LEAF) { c.states.data[at].first = e; }
+        or                { c.edges.data[last].sib = e; }
+        c.states.data[at].last = e;
+        if (end) { brk; }
+        at = child;
+        d  = d + 1;
+    }
+    ret true;
+}
+
+# compile a trie state and everything below it, giving its instruction
+fun build(c: *Compiler, at: u32, next: u32) u32 {
+    var count: u32 = 0;
+    var e:     u32 = c.states.data[at].first;
+    for (e != LEAF) {
+        var target: u32 = next;
+        if (c.edges.data[e].child != LEAF) { target = build(c, c.edges.data[e].child, next); }
+        if (c.failed)                      { ret 0; }
+        c.edges.data[e].target = target;
+        count                  = count + 1;
+        e                      = c.edges.data[e].sib;
+    }
+    val first: u32 = c.states.data[at].first;
+    if (count == 1) { ret range(c, c.edges.data[first].lo, c.edges.data[first].hi, c.edges.data[first].target); }
+    val start: u32 = c.prog.trans.len::u32;
+    e = first;
+    for (e != LEAF) {
+        val t:      Trans               = Trans{lo: c.edges.data[e].lo, hi: c.edges.data[e].hi, next: c.edges.data[e].target};
+        val pushed: res[usize, A.Error] = vector.push[Trans](?c.prog.trans, t);
+        if (sel pushed.err) {
+            fail(c, Kind.memory{}, 0);
+            ret 0;
+        }
+        e = c.edges.data[e].sib;
+    }
+    ret emit(c, Inst.sparse{Sparse{start: start, len: count}});
+}
