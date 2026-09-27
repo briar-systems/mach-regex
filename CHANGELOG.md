@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - A lazy DFA in front of the Pike VM (#33): `is_match` runs it forward and stops at the first match, and `find` runs it forward to where the leftmost match ends, then over a reverse program (#32) back to where it begins. Its states live in an arena in the `Cache` sized when the cache is made, so a search still allocates nothing, and a search that thrashes it falls back to the Pike VM. Transitions are indexed by byte class (#31) and tagged, so the search tests one word per byte (#43).
+- The DFA searches run a tight inner loop over untagged transitions, with the text and tables in locals, 1.2 to 1.5 times faster on DFA-bound searches (#49).
 - `captures` resolves groups within the span the DFAs found, so the backtracker takes far more matches and the Pike VM stops at the match's end (#50). A large lexer alternation with captures runs about 19 times faster.
 - A one-pass engine (#35) and a bounded backtracker (#36) resolve the groups of a match `captures` has found the bounds of, with the Pike VM for what neither takes.
 - Prefilters that skip ahead while no match is in progress (#34): a required literal prefix is found by its rarest byte, and a pattern whose matches begin with one of at most three bytes scans for any of them. Literal search in Russian and Chinese text runs about 20 and 7 times faster.
