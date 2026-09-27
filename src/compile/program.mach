@@ -100,19 +100,23 @@ pub val MAX_PREFIX: u32 = 16;
 
 # a compiled program
 # ---
-# insts:      the instructions
-# trans:      the transitions of every sparse instruction
-# start:      the first instruction
-# slots:      the number of capture slots, two per group and two for the whole match
-# prefix:     bytes every match begins with, the first prefix_len of them
-# prefix_len: how many bytes of prefix are required, 0 for none
+# insts:       the instructions
+# trans:       the transitions of every sparse instruction
+# start:       the first instruction
+# slots:       the number of capture slots, two per group and two for the whole match
+# prefix:      bytes every match begins with, the first prefix_len of them
+# prefix_len:  how many bytes of prefix are required, 0 for none
+# classes:     each byte's class. the program never tells two bytes of a class apart
+# class_count: how many classes there are
 pub rec Prog {
-    insts:      Vector[Inst];
-    trans:      Vector[Trans];
-    start:      u32;
-    slots:      u32;
-    prefix:     [16]u8;
-    prefix_len: u32;
+    insts:       Vector[Inst];
+    trans:       Vector[Trans];
+    start:       u32;
+    slots:       u32;
+    prefix:      [16]u8;
+    prefix_len:  u32;
+    classes:     [256]u8;
+    class_count: u32;
 }
 
 # an empty program drawing on an allocator
