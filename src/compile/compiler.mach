@@ -75,31 +75,33 @@ rec Edge {
 
 # the state of one compilation
 # ---
-# tree:   the Ast
-# prog:   the program being built
-# failed: an error was recorded
-# err:    the first error
-# set:    the code points of the class being compiled
-# part:   one member's code points
-# tmp:    scratch for negation
-# seqs:   the utf-8 sequences of the class
-# states: the trie's states
-# edges:  the trie's edges
-# cache:  one-range instructions by range and successor
-# null:   whether each node can match empty, 0 when not yet known, 1 no, 2 yes
+# tree:    the Ast
+# prog:    the program being built
+# reverse: the program reads the text right to left
+# failed:  an error was recorded
+# err:     the first error
+# set:     the code points of the class being compiled
+# part:    one member's code points
+# tmp:     scratch for negation
+# seqs:    the utf-8 sequences of the class
+# states:  the trie's states
+# edges:   the trie's edges
+# cache:   one-range instructions by range and successor
+# null:    whether each node can match empty, 0 when not yet known, 1 no, 2 yes
 rec Compiler {
-    tree:   *syntax.Ast;
-    prog:   *Prog;
-    failed: bool;
-    err:    syntax.Error;
-    set:    Vector[Range];
-    part:   Vector[Range];
-    tmp:    Vector[Range];
-    seqs:   Vector[Seq];
-    states: Vector[State];
-    edges:  Vector[Edge];
-    cache:  Map[u64, u32];
-    null:   Vector[u8];
+    tree:    *syntax.Ast;
+    prog:    *Prog;
+    reverse: bool;
+    failed:  bool;
+    err:     syntax.Error;
+    set:     Vector[Range];
+    part:    Vector[Range];
+    tmp:     Vector[Range];
+    seqs:    Vector[Seq];
+    states:  Vector[State];
+    edges:   Vector[Edge];
+    cache:   Map[u64, u32];
+    null:    Vector[u8];
 }
 
 # compile an Ast to a program
@@ -108,18 +110,36 @@ rec Compiler {
 # tree: the Ast, whose unicode class names are resolved here
 # ret:  the program, or the first error
 pub fun compile(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
+    ret generate(a, tree, false);
+}
+
+# compile an Ast to a program that reads the text right to left
+#
+# it accepts a text reversed exactly when the forward program accepts the text,
+# so run backward from where a match ends, it finds where the match can begin.
+# it records no captures and has no prefix.
+# ---
+# a:    the allocator the program grows in
+# tree: the Ast, whose unicode class names are resolved here
+# ret:  the program, or the first error
+pub fun reverse(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
+    ret generate(a, tree, true);
+}
+
+fun generate(a: *A.Allocator, tree: *syntax.Ast, backward: bool) res[Prog, syntax.Error] {
     var p: Prog     = prog.init(a);
     var c: Compiler = Compiler{
-        tree:   tree,
-        prog:   ?p,
-        set:    vector.init[Range](a),
-        part:   vector.init[Range](a),
-        tmp:    vector.init[Range](a),
-        seqs:   vector.init[Seq](a),
-        states: vector.init[State](a),
-        edges:  vector.init[Edge](a),
-        cache:  map.init[u64, u32](a),
-        null:   vector.init[u8](a),
+        tree:    tree,
+        prog:    ?p,
+        reverse: backward,
+        set:     vector.init[Range](a),
+        part:    vector.init[Range](a),
+        tmp:     vector.init[Range](a),
+        seqs:    vector.init[Seq](a),
+        states:  vector.init[State](a),
+        edges:   vector.init[Edge](a),
+        cache:   map.init[u64, u32](a),
+        null:    vector.init[u8](a),
     };
     fin {
         vector.dnit[Range](?c.set);
@@ -142,14 +162,17 @@ pub fun compile(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
         k = k + 1;
     }
     val done: u32 = emit(?c, Inst.match{});
-    val end:  u32 = emit(?c, Inst.save{Save{slot: 1, next: done}});
-    val body: u32 = node(?c, tree.root, end);
-    p.start = emit(?c, Inst.save{Save{slot: 0, next: body}});
-    p.slots = (tree.names.len * 2)::u32;
-    if (!c.failed) {
-        prefix(?p);
-        classify(?p);
+    if (backward) {
+        p.start = node(?c, tree.root, done);
     }
+    or {
+        val end:  u32 = emit(?c, Inst.save{Save{slot: 1, next: done}});
+        val body: u32 = node(?c, tree.root, end);
+        p.start = emit(?c, Inst.save{Save{slot: 0, next: body}});
+        p.slots = (tree.names.len * 2)::u32;
+        if (!c.failed) { prefix(?p); }
+    }
+    if (!c.failed) { classify(?p); }
     if (c.failed) {
         prog.dnit(?p);
         ret res[Prog, syntax.Error].err{c.err};
@@ -319,6 +342,7 @@ fun node(c: *Compiler, i: usize, next: u32) u32 {
     if (sel n.word_boundary)     { ret look(c, Assert.word_boundary{}, next); }
     if (sel n.not_word_boundary) { ret look(c, Assert.not_word_boundary{}, next); }
     if (sel n.capture) {
+        if (c.reverse) { ret node(c, n.capture.sub, next); }
         val slot: u32 = n.capture.index * 2;
         val end:  u32 = emit(c, Inst.save{Save{slot: slot + 1, next: next}});
         val body: u32 = node(c, n.capture.sub, end);
@@ -326,8 +350,17 @@ fun node(c: *Compiler, i: usize, next: u32) u32 {
     }
     if (sel n.repeat) { ret repeat(c, n.repeat, next); }
     if (sel n.concat) {
-        var at: u32   = next;
-        var k:  usize = n.concat.len;
+        var at: u32 = next;
+        # read backward, the first part is read last, so it is compiled first
+        if (c.reverse) {
+            var k: usize = 0;
+            for (k < n.concat.len) {
+                at = node(c, c.tree.kids.data[n.concat.start + k], at);
+                k  = k + 1;
+            }
+            ret at;
+        }
+        var k: usize = n.concat.len;
         for (k > 0) {
             k  = k - 1;
             at = node(c, c.tree.kids.data[n.concat.start + k], at);
@@ -424,7 +457,15 @@ fun literal(c: *Compiler, cp: u32, fold: bool, next: u32) u32 {
     var bytes: [4]u8;
     val n:     u32 = utf8.encode(cp, ?bytes[0]);
     var at:    u32 = next;
-    var k:     u32 = n;
+    if (c.reverse) {
+        var k: u32 = 0;
+        for (k < n) {
+            at = range(c, bytes[k], bytes[k], at);
+            k  = k + 1;
+        }
+        ret at;
+    }
+    var k: u32 = n;
     for (k > 0) {
         k  = k - 1;
         at = range(c, bytes[k], bytes[k], at);
@@ -505,6 +546,7 @@ fun set(c: *Compiler, next: u32) u32 {
         k = k + 1;
     }
     if (c.seqs.len == 0) { ret emit(c, Inst.fail{}); }
+    if (c.reverse)       { ret backward(c, next); }
     c.states.len = 0;
     c.edges.len  = 0;
     if (!state(c)) { ret 0; }
@@ -514,6 +556,32 @@ fun set(c: *Compiler, next: u32) u32 {
         k = k + 1;
     }
     ret build(c, 0, next);
+}
+
+# the sequences in c.seqs read backward, each a chain of ranges ending at its
+# lead byte, joined by splits
+#
+# reversed, the sequences no longer arrive in byte order and their first ranges
+# overlap, so they cannot share a trie. chains with the same tail share it
+# through the range cache.
+fun backward(c: *Compiler, next: u32) u32 {
+    var at: u32   = chain(c, c.seqs.data[c.seqs.len - 1], next);
+    var k:  usize = c.seqs.len - 1;
+    for (k > 0) {
+        k  = k - 1;
+        at = emit(c, Inst.split{Split{x: chain(c, c.seqs.data[k], next), y: at}});
+    }
+    ret at;
+}
+
+fun chain(c: *Compiler, s: Seq, next: u32) u32 {
+    var at: u32 = next;
+    var d:  u32 = 0;
+    for (d < s.len) {
+        at = range(c, s.lo[d], s.hi[d], at);
+        d  = d + 1;
+    }
+    ret at;
 }
 
 # a new empty trie state, giving false when the allocator refuses
@@ -647,6 +715,11 @@ rec Compiled {
 
 #[testing]
 fun open(c: *Compiled, pattern: str) {
+    open_as(c, pattern, false);
+}
+
+#[testing]
+fun open_as(c: *Compiled, pattern: str, backward: bool) {
     testing.make(?c.t);
     val a:     *A.Allocator                  = testing.allocator_of(?c.t);
     var flags: syntax.Flags;
@@ -654,7 +727,7 @@ fun open(c: *Compiled, pattern: str) {
     c.ok = false;
     if (sel tree.err) { ret; }
     c.tree = tree.ok;
-    val p: res[Prog, syntax.Error] = compile(a, ?c.tree);
+    val p: res[Prog, syntax.Error] = generate(a, ?c.tree, backward);
     if (sel p.err) {
         syntax.dnit(?c.tree);
         ret;
@@ -690,6 +763,19 @@ fun accepts(c: *Compiled, s: *u8, n: usize) bool {
 #[testing]
 fun takes(c: *Compiled, s: str) bool {
     ret accepts(c, s, str_len(s));
+}
+
+# whether the program accepts the text read backward
+#[testing]
+fun takes_backward(c: *Compiled, s: str) bool {
+    var b: [64]u8;
+    val n: usize = str_len(s);
+    var k: usize = 0;
+    for (k < n) {
+        b[k] = s[n - 1 - k];
+        k    = k + 1;
+    }
+    ret accepts(c, ?b[0], n);
 }
 
 # whether the program accepts a code point's encoding
@@ -830,5 +916,21 @@ test compile__byte_classes {
     # a word boundary also sets the ascii word bytes apart
     if (!c.ok || c.prog.classes['_'] == c.prog.classes['^'] || c.prog.classes['0'] == c.prog.classes['/']) { ret 5; }
     if (!close(?c))                                                                                        { ret 6; }
+    ret 0;
+}
+
+test reverse__accepts_the_text_backward {
+    var c: Compiled;
+    open_as(?c, "abc", true);
+    if (!c.ok || !takes_backward(?c, "abc") || takes(?c, "abc") || c.prog.slots != 0) { ret 1; }
+    if (!close(?c))                                                                   { ret 2; }
+    open_as(?c, "a(b|cd)*e", true);
+    if (!c.ok || !takes_backward(?c, "acdbe") || !takes_backward(?c, "ae") || takes_backward(?c, "ace")) { ret 3; }
+    if (!close(?c))                                                                                      { ret 4; }
+    # classes and folded literals read their utf-8 backward too
+    open_as(?c, "\\p{Greek}[a-c]\xc3\xa9(?i)k", true);
+    if (!c.ok || !takes_backward(?c, "\xce\xb1b\xc3\xa9\xe2\x84\xaa") || !takes_backward(?c, "\xcf\x89a\xc3\xa9K")) { ret 5; }
+    if (takes_backward(?c, "\xce\xb1d\xc3\xa9k") || takes(?c, "\xce\xb1b\xc3\xa9k"))                                { ret 6; }
+    if (!close(?c))                                                                                                 { ret 7; }
     ret 0;
 }

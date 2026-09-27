@@ -5,8 +5,9 @@
 # enters in a bitset and never enters one twice. what follows a state depends
 # only on the state, so a state already entered can add nothing, and a search
 # takes time proportional to the program times the span, whatever the pattern.
-# the bitset holds one bit per state, so the backtracker applies only when the
-# program's instructions times the span plus one fit CAPACITY. it gives
+# the bitset holds one bit per state and the stack cannot grow, so the
+# backtracker applies only when the program's instructions times the span plus
+# one fit CAPACITY and the worst case of its frames fits STACK. it gives
 # exactly what the pike vm gives for the same arguments, captures included,
 # under leftmost-first and leftmost-longest. all scratch is in a Cache sized
 # when it is made, so a search makes no allocation.
@@ -38,12 +39,15 @@ use regex.syntax;
 # a capture slot no path has set
 pub val NONE: usize = 0xFFFFFFFFFFFFFFFF;
 
-# the most states, instructions times positions, a search may cover
-#
-# RE2's bitstate uses the same bound. the stack cannot grow during a search,
-# so it is sized for the worst case, and a larger bitset would cost eight
-# bytes of stack for every bit.
+# the most states, instructions times positions, a search may cover, as in
+# RE2's bitstate
 pub val CAPACITY: usize = 256 * 1024;
+
+# the most frames a cache's stack holds, 128 KiB of them
+#
+# the stack cannot grow during a search, so a search may cover only as many
+# positions as the worst case of the program's pushing instructions fits.
+pub val STACK: usize = 16 * 1024;
 
 # marks a restore frame in a frame's first word
 val RESTORE: u32 = 0x80000000;
@@ -66,27 +70,28 @@ rec Frame {
 
 # the scratch of a search, sized for one program
 # ---
-# visited: one bit per state, instruction major
-# stack:   the pending frames
-# slots:   the slots of the path being followed
-# best:    the slots of the longest match so far
-# size:    the program's instruction count it was sized for
+# visited:   one bit per state, instruction major
+# stack:     the pending frames
+# slots:     the slots of the path being followed
+# best:      the slots of the longest match so far
+# size:      the program's instruction count it was sized for
+# positions: the most positions a search may cover, the span plus one
 pub rec Cache {
-    visited: Vector[u64];
-    stack:   Vector[Frame];
-    slots:   Vector[usize];
-    best:    Vector[usize];
-    size:    usize;
+    visited:   Vector[u64];
+    stack:     Vector[Frame];
+    slots:     Vector[usize];
+    best:      Vector[usize];
+    size:      usize;
+    positions: usize;
 }
 
-# whether a search over a span fits the capacity
+# whether a search over a span fits the bitset and the stack
 # ---
-# p:    the program
+# c:    a cache made for the program
 # span: the bytes from the search's start to the end of the text
 # ret:  whether the backtracker can search it
-pub fun fits(p: *Prog, span: usize) bool {
-    val size: usize = p.insts.len;
-    ret size > 0 && span < CAPACITY && size * (span + 1) <= CAPACITY;
+pub fun fits(c: *Cache, span: usize) bool {
+    ret span < c.positions;
 }
 
 # make the scratch for searching a program
@@ -111,7 +116,9 @@ pub fun init(a: *A.Allocator, p: *Prog, c: *Cache) bool {
         k = k + 1;
     }
     var positions: usize = 0;
-    if (size > 0) { positions = CAPACITY / size; }
+    if (size > 0)                                       { positions = CAPACITY / size; }
+    if (pushers > 0 && pushers * positions + 1 > STACK) { positions = (STACK - 1) / pushers; }
+    c.positions = positions;
     val visited: res[usize, A.Error] = vector.ensure[u64](?c.visited, (CAPACITY + 63) / 64);
     val stack:   res[usize, A.Error] = vector.ensure[Frame](?c.stack, pushers * positions + 1);
     val slots:   res[usize, A.Error] = vector.ensure[usize](?c.slots, p.slots::usize);
@@ -274,7 +281,7 @@ fun run(p: *Prog, c: *Cache, text: View, base: usize, width: usize, from: usize,
 # search a text for the program's match, as the pike vm does
 #
 # the arguments and the result are the pike vm's, and so is the match. the
-# search must fit: fits(p, text.len - start).
+# search must fit: fits(c, text.len - start).
 # ---
 # p:        the program
 # c:        scratch sized for the program
@@ -414,7 +421,7 @@ fun agree_all(e: *Engines, text: View) usize {
     val slots:    usize = e.prog.slots::usize;
     var start:    usize = 0;
     for (start <= text.len) {
-        if (!boundary(text, start) || !fits(?e.prog, text.len - start)) {
+        if (!boundary(text, start) || !fits(?e.bt, text.len - start)) {
             start = start + 1;
             cnt;
         }
@@ -532,11 +539,11 @@ test search__linear_at_capacity {
     # the longest run of a that fits, with no b for the exponential paths to find
     var run:  [65536]u8;
     var span: usize = 0;
-    for (span < 65536 && fits(?e.prog, span + 1)) {
+    for (span < 65536 && fits(?e.bt, span + 1)) {
         run[span] = 'a';
         span      = span + 1;
     }
-    if (span == 0 || span >= 65536 || fits(?e.prog, span + 1)) { ret 2; }
+    if (span == 0 || span >= 65536 || fits(?e.bt, span + 1)) { ret 2; }
     var out: [6]usize;
     if (search(?e.prog, ?e.bt, view(?run[0], span), 0, false, false, 6, ?out[0])) { ret 3; }
     # and with the b at the end, both engines resolve the same captures

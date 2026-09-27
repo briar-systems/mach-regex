@@ -14,11 +14,19 @@ a capture slot no path has set
 pub val CAPACITY: usize = 256 * 1024
 ```
 
-the most states, instructions times positions, a search may cover
+the most states, instructions times positions, a search may cover, as in
+RE2's bitstate
 
-RE2's bitstate uses the same bound. the stack cannot grow during a search,
-so it is sized for the worst case, and a larger bitset would cost eight
-bytes of stack for every bit.
+## val STACK
+
+```mach
+pub val STACK: usize = 16 * 1024
+```
+
+the most frames a cache's stack holds, 128 KiB of them
+
+the stack cannot grow during a search, so a search may cover only as many
+positions as the worst case of the program's pushing instructions fits.
 
 ## rec Cache
 
@@ -33,16 +41,17 @@ stack: the pending frames
 slots: the slots of the path being followed
 best: the slots of the longest match so far
 size: the program's instruction count it was sized for
+positions: the most positions a search may cover, the span plus one
 
 ## fun fits
 
 ```mach
-pub fun fits(p: *Prog, span: usize) bool;
+pub fun fits(c: *Cache, span: usize) bool;
 ```
 
-whether a search over a span fits the capacity
+whether a search over a span fits the bitset and the stack
 
-p: the program
+c: a cache made for the program
 span: the bytes from the search's start to the end of the text
 ret: whether the backtracker can search it
 
@@ -78,7 +87,7 @@ pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, lo
 search a text for the program's match, as the pike vm does
 
 the arguments and the result are the pike vm's, and so is the match. the
-search must fit: fits(p, text.len - start).
+search must fit: fits(c, text.len - start).
 
 p: the program
 c: scratch sized for the program

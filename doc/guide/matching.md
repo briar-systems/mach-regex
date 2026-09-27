@@ -44,21 +44,35 @@ and nothing more.
 ## Cost
 
 Every search takes time proportional to the size of the compiled pattern times
-the length of the text searched, whatever the pattern and whatever the text.
-The engine runs every way the pattern could match in step, keeping at most one
-thread per instruction, and never backtracks, so no pattern can make a search
-run away: `(a*)*b` against a long run of `a` fails in one pass. This is what
-rules out the syntax RE2 leaves out, as the [syntax](syntax.md) guide explains.
+the length of the text searched, whatever the pattern and whatever the text. No
+engine here tries the same way of matching twice at the same place, so no
+pattern can make a search run away: `(a*)*b` against a long run of `a` fails in
+one pass. This is what rules out the syntax RE2 leaves out, as the
+[syntax](syntax.md) guide explains.
 
-`captures` over a short enough rest of the text runs a backtracker instead,
-which follows one way at a time but marks every instruction and position it
-reaches and never enters one twice, so it keeps the same bound with less work
-per byte. It applies while the compiled pattern's size times the length
-searched stays within 256K, and gives exactly the same match and groups.
+A search runs a lazy DFA. As the text calls for them, it builds states that
+each stand for every way the pattern could be matching at once, so reading a
+byte soon becomes a single table lookup. It reads forward to where the leftmost
+match ends, then runs a reversed copy of the pattern backward from there to
+where the match begins. Its states live in a fixed arena in the `Cache`. A
+pattern that needs more states than the arena holds too often makes the search
+fall back to a Pike VM, which runs every way of matching in step with at most
+one thread per instruction.
 
 A pattern whose every match begins with the same literal bytes, as `hello` in
 `hello\s+world`, is searched faster: while no match is in progress, the search
 skips to the next place those bytes occur, scanning sixteen bytes at a time.
+
+`captures` needs only the groups of a match whose bounds the DFA has found. A
+one-pass pattern, one where at every step at most one way of matching can
+still go on, is compiled once more into a table that resolves them in a single
+pass, as RE2 and Rust do. Any other pattern, when the text from the match's
+start is short enough, runs a backtracker, which follows one way at a time but
+marks every instruction and position it reaches and never enters one twice, so
+it keeps the same bound with less work per byte. It applies while the compiled
+pattern's size times that length stays within 256K and its stack of 16K frames
+holds the worst case. Anything longer runs the Pike VM from where the match
+begins. Every path gives the result the Pike VM alone would give.
 
 Compiling allocates through the allocator it is given. A search runs entirely
 in its `Cache` and allocates nothing.
