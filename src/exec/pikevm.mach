@@ -7,7 +7,8 @@
 # once, so a search takes time proportional to the program times the text,
 # whatever the pattern. new threads start only at code point boundaries, and
 # only until a match is found. when no thread is alive and the program has a
-# required prefix, the search jumps to its next occurrence. leftmost-first cuts the threads after a match,
+# required prefix or a small set of first bytes, the search jumps to the next
+# place a match could begin. leftmost-first cuts the threads after a match,
 # and leftmost-longest keeps them but drops any that started after it, as RE2
 # does. all scratch is in a Cache sized for the program, so a search makes
 # no allocation.
@@ -269,7 +270,7 @@ pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, lo
     c.steps = 0;
     for {
         # with nothing running, no match can begin before the prefix's next occurrence
-        if (!matched && !anchored && cur.len == 0 && p.prefix_len > 0) {
+        if (!matched && !anchored && cur.len == 0 && prefix.skips(p)) {
             if (!prefix.candidate(p, text, at, ?at)) { brk; }
         }
         # a new thread starting here, after every thread already running
