@@ -624,6 +624,8 @@ pub fun forward(d: *Dfa, p: *Prog, text: View, from: usize, earliest: bool) Outc
     d.since   = from;
     val trans:   *u32  = d.trans.data;
     val classes: *u8   = ?p.classes[0];
+    val data:    *u8   = text.data;
+    val len:     usize = text.len;
     var h:       u32   = start(d, p, context_at(d, text, from - 1, from == 0), false);
     var last:    usize = NONE;
     var at:      usize = from;
@@ -646,7 +648,7 @@ pub fun forward(d: *Dfa, p: *Prog, text: View, from: usize, earliest: bool) Outc
                 if (h == UNKNOWN) { ret Outcome.gave_up{}; }
             }
         }
-        if (at >= text.len) {
+        if (at >= len) {
             var t: u32 = trans[(h & OFFSET)::usize + d.stride - 1];
             if (t == UNKNOWN) {
                 var s: u32 = state(d, h);
@@ -656,14 +658,19 @@ pub fun forward(d: *Dfa, p: *Prog, text: View, from: usize, earliest: bool) Outc
             if ((t & MATCHED) != 0) { last = at; }
             brk;
         }
-        val b: u8  = text.data[at];
-        var t: u32 = trans[(h & OFFSET)::usize + classes[b]::usize];
-        # the common case: a known state with nothing to stop for
-        if (t < IDLE) {
-            h  = t;
-            at = at + 1;
-            cnt;
+        # the common case, kept tight: known transitions with nothing to stop for,
+        # through bare row offsets, since idle, dead and matching states are tagged
+        var row: usize = (h & OFFSET)::usize;
+        var t:   u32   = trans[row + classes[data[at]]::usize];
+        for (t < IDLE) {
+            row = t::usize;
+            at  = at + 1;
+            if (at >= len) { brk; }
+            t = trans[row + classes[data[at]]::usize];
         }
+        h = row::u32;
+        if (at >= len) { cnt; }
+        val b: u8 = data[at];
         if (t == UNKNOWN) {
             var s: u32 = state(d, h);
             t = transition(d, p, ?s, classes[b]::usize, b, false, at);
@@ -694,6 +701,7 @@ pub fun backward(d: *Dfa, p: *Prog, text: View, from: usize, end: usize) Outcome
     d.since   = end;
     val trans:   *u32  = d.trans.data;
     val classes: *u8   = ?p.classes[0];
+    val data:    *u8   = text.data;
     var h:       u32   = start(d, p, context_at(d, text, end, end == text.len), true);
     var last:    usize = NONE;
     var at:      usize = end;
@@ -716,13 +724,18 @@ pub fun backward(d: *Dfa, p: *Prog, text: View, from: usize, end: usize) Outcome
             if (expand(d, p, s, looks(d, d.flags.data[s], false, text.data[at - 1]), false, ?keep)) { last = at; }
             brk;
         }
-        val b: u8  = text.data[at - 1];
-        var t: u32 = trans[(h & OFFSET)::usize + classes[b]::usize];
-        if (t < IDLE) {
-            h  = t;
-            at = at - 1;
-            cnt;
+        # the common case, kept tight, as in forward
+        var row: usize = (h & OFFSET)::usize;
+        var t:   u32   = trans[row + classes[data[at - 1]]::usize];
+        for (t < IDLE) {
+            row = t::usize;
+            at  = at - 1;
+            if (at == from) { brk; }
+            t = trans[row + classes[data[at - 1]]::usize];
         }
+        h = row::u32;
+        if (at == from) { cnt; }
+        val b: u8 = data[at - 1];
         if (t == UNKNOWN) {
             var s: u32 = state(d, h);
             t = transition(d, p, ?s, classes[b]::usize, b, false, at);
