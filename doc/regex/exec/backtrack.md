@@ -99,3 +99,26 @@ active: how many slots to record, at least 2 and at most the program's
 out: where the slots of the match go, active of them
 ret: whether there is a match
 
+## fun search_within
+
+```mach
+pub fun search_within(p: *Prog, c: *Cache, text: View, start: usize, limit: usize, anchored: bool, longest: bool, active: usize, out: *usize) bool;
+```
+
+search a text for the program's match, reading no byte at or past limit
+
+assertions still see the whole text, so a match known to end by limit is
+found with the same groups, as when the lazy dfas have found its bounds. the
+search must fit: fits(c, limit - start).
+
+p: the program
+c: scratch sized for the program
+text: the text
+start: where the search begins, a code point boundary
+limit: where reading stops, at most the text's length
+anchored: a match must begin at start
+longest: leftmost-longest rather than leftmost-first
+active: how many slots to record, at least 2 and at most the program's
+out: where the slots of the match go, active of them
+ret: whether there is a match
+

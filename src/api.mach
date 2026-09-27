@@ -358,10 +358,12 @@ pub fun captures(re: *Regex, c: *Cache, text: View, from: usize, slots: *usize) 
     if (sel b.none) { ret false; }
     if (sel b.found) {
         # the match begins where the dfas found, so an anchored engine need only resolve its groups
+        # and it ends where they found, so neither need read past that
         val start: usize = b.found.start;
-        if (re.onepass.ready)                        { ret onepass.search(?re.prog, ?re.onepass, ?c.one, text, start, re.longest, slot_count(re), slots); }
-        if (backtrack.fits(?c.bt, text.len - start)) { ret backtrack.search(?re.prog, ?c.bt, text, start, true, re.longest, slot_count(re), slots); }
-        ret pikevm.search(?re.prog, ?c.vm, text, start, true, re.longest, slot_count(re), slots);
+        val end:   usize = b.found.end;
+        if (re.onepass.ready)                   { ret onepass.search(?re.prog, ?re.onepass, ?c.one, text, start, re.longest, slot_count(re), slots); }
+        if (backtrack.fits(?c.bt, end - start)) { ret backtrack.search_within(?re.prog, ?c.bt, text, start, end, true, re.longest, slot_count(re), slots); }
+        ret pikevm.search_within(?re.prog, ?c.vm, text, start, end, true, re.longest, slot_count(re), slots);
     }
     if (backtrack.fits(?c.bt, text.len - at)) { ret backtrack.search(?re.prog, ?c.bt, text, at, false, re.longest, slot_count(re), slots); }
     ret pikevm.search(?re.prog, ?c.vm, text, at, false, re.longest, slot_count(re), slots);
