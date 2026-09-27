@@ -23,27 +23,6 @@ use regex.compile.program;
 use regex.compile.program.Prog;
 use regex.syntax;
 
-# how common each byte is in typical text, higher for more common, from the
-# memchr crate's default ranking, which is in the public domain
-val RANK: [256]u8 = [256]u8{
-    55, 52, 51, 50, 49, 48, 47, 46, 45, 103, 242, 66, 67, 229, 44, 43,
-    42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 56, 32, 31, 30, 29, 28,
-    255, 148, 164, 149, 136, 160, 155, 173, 221, 222, 134, 122, 232, 202, 215, 224,
-    208, 220, 204, 187, 183, 179, 177, 168, 178, 200, 226, 195, 154, 184, 174, 126,
-    120, 191, 157, 194, 170, 189, 162, 161, 150, 193, 142, 137, 171, 176, 185, 167,
-    186, 112, 175, 192, 188, 156, 140, 143, 123, 133, 128, 147, 138, 146, 114, 223,
-    151, 249, 216, 238, 236, 253, 227, 218, 230, 247, 135, 180, 241, 233, 246, 244,
-    231, 139, 245, 243, 251, 235, 201, 196, 240, 214, 152, 182, 205, 181, 127, 27,
-    212, 211, 210, 213, 228, 197, 169, 159, 131, 172, 105, 80, 98, 96, 97, 81,
-    207, 145, 116, 115, 144, 130, 153, 121, 107, 132, 109, 110, 124, 111, 82, 108,
-    118, 141, 113, 129, 119, 125, 165, 117, 92, 106, 83, 72, 99, 93, 65, 79,
-    166, 237, 163, 199, 190, 225, 209, 203, 198, 217, 219, 206, 234, 248, 158, 239,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-};
-
 # the first position at or after from holding a byte, or the text's length
 fun scan(text: View, from: usize, b: u8) usize {
     val needle: u8x16 = u8x16{b, b, b, b, b, b, b, b, b, b, b, b, b, b, b, b};
@@ -70,10 +49,36 @@ pub fun skips(p: *Prog) bool {
     ret p.prefix_len > 0 || p.first_count > 0;
 }
 
-# the first position at or after from holding any of the program's two to
+# the first position at or after from holding any of two or three bytes, or the text's length
+#
+# unrolled, since a loop over the set costs a small set a fifth of its speed
+fun scan_few(text: View, from: usize, p: *Prog) usize {
+    val b0: u8 = p.firsts[0];
+    val b1: u8 = p.firsts[1];
+    var b2: u8 = p.firsts[1];
+    if (p.first_count == 3) { b2 = p.firsts[2]; }
+    val n0: u8x16 = u8x16{b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0};
+    val n1: u8x16 = u8x16{b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1};
+    val n2: u8x16 = u8x16{b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2};
+    var at: usize = from;
+    for (at + 16 <= text.len) {
+        val chunk: u8x16 = text.data[at, 16]::u8x16;
+        val hits:  u64x2 = ((chunk == n0) | (chunk == n1) | (chunk == n2)):~u64x2;
+        val low:   u64   = hits[0];
+        if (low != 0) { ret at + (bits.ctz(low) / 8)::usize; }
+        val high: u64 = hits[1];
+        if (high != 0) { ret at + 8 + (bits.ctz(high) / 8)::usize; }
+        at = at + 16;
+    }
+    for (at < text.len && text.data[at] != b0 && text.data[at] != b1 && text.data[at] != b2) { at = at + 1; }
+    ret at;
+}
+
+# the first position at or after from holding any of the program's four to
 # sixteen first bytes, or the text's length
 fun scan_any(text: View, from: usize, p: *Prog) usize {
-    val n:       usize = p.first_count::usize;
+    val n: usize = p.first_count::usize;
+    if (n <= 3) { ret scan_few(text, from, p); }
     var needles: [16]u8x16;
     var j:       usize = 0;
     for (j < n) {
@@ -113,7 +118,7 @@ fun literal(p: *Prog, text: View, from: usize, at: *usize) bool {
     var rare: usize = 0;
     var k:    usize = 1;
     for (k < n) {
-        if (RANK[p.prefix[k]] < RANK[p.prefix[rare]]) { rare = k; }
+        if (program.RANK[p.prefix[k]] < program.RANK[p.prefix[rare]]) { rare = k; }
         k = k + 1;
     }
     var here: usize = from;
@@ -195,12 +200,12 @@ test candidate__many_first_bytes {
     if (next_in(holmes, "xxxxxxxxxxxxxxxxxxxxJohn Irene", 0) != 20)  { ret 1; }
     if (next_in(holmes, "xxxxxxxxxxxxxxxxxxxxJohn Irene", 21) != 25) { ret 2; }
     # the last byte of the first chunk, in the second chunk, and in the tail
-    val sixteen: str = "a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p";
-    val text:    str = "xxxxxxxxxxxxxxxkxpxxxxxxxxxxxxxxxa";
+    val sixteen: str = "A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P";
+    val text:    str = "xxxxxxxxxxxxxxxKxPxxxxxxxxxxxxxxxA";
     if (next_in(sixteen, text, 0) != 15)  { ret 3; }
     if (next_in(sixteen, text, 16) != 17) { ret 4; }
     if (next_in(sixteen, text, 19) != 33) { ret 5; }
     # seventeen first bytes are too many to skip by
-    if (next_in("a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q", "xxa", 0) != 3) { ret 6; }
+    if (next_in("A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P|Q", "xxA", 0) != 3) { ret 6; }
     ret 0;
 }

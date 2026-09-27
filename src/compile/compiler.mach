@@ -50,6 +50,9 @@ val LEAF: u32 = 0xFFFFFFFF;
 # a free slot in the range cache
 val EMPTY: u32 = 0xFFFFFFFF;
 
+# a byte ranked at least this common rules a set of more than three first bytes out
+val COMMON: u8 = 200;
+
 # a node whose utf-8 sequences are not yet known
 val NO_MEMO: u64 = 0xFFFFFFFFFFFFFFFF;
 
@@ -346,6 +349,15 @@ fun firsts(c: *Compiler, a: *A.Allocator) {
         }
     }
     if (count == 0) { ret; }
+    # a larger set is worth scanning for only when all of it is uncommon, as
+    # capitals beginning an alternation of names are and lowercase letters are not
+    if (count > 3) {
+        var k: usize = 0;
+        for (k < 256) {
+            if (bytes[k] != 0 && prog.RANK[k] >= COMMON) { ret; }
+            k = k + 1;
+        }
+    }
     var n: u32   = 0;
     var b: usize = 0;
     for (b < 256) {
@@ -1179,11 +1191,15 @@ test compile__first_bytes {
     open(?c, "Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty");
     if (!c.ok || c.prog.first_count != 4 || c.prog.firsts[0] != 'I' || c.prog.firsts[1] != 'J' || c.prog.firsts[2] != 'P' || c.prog.firsts[3] != 'S') { ret 5; }
     if (!close(?c))                                                                                                                                   { ret 6; }
-    open(?c, "a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p");
-    if (!c.ok || c.prog.first_count != 16 || c.prog.firsts[15] != 'p') { ret 7; }
+    open(?c, "A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P");
+    if (!c.ok || c.prog.first_count != 16 || c.prog.firsts[15] != 'P') { ret 7; }
     if (!close(?c))                                                    { ret 8; }
-    # a seventeenth byte, an assertion first, or a match without a byte leave none
-    open(?c, "a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q");
+    # a seventeenth byte, more than three common bytes, an assertion first, or a
+    # match without a byte leave none
+    open(?c, "a|b|c|d");
+    if (!c.ok || c.prog.first_count != 0) { ret 15; }
+    if (!close(?c))                       { ret 16; }
+    open(?c, "A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P|Q");
     if (!c.ok || c.prog.first_count != 0) { ret 9; }
     if (!close(?c))                       { ret 10; }
     open(?c, "\\ba");
