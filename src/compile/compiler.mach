@@ -197,6 +197,7 @@ fun generate(a: *A.Allocator, tree: *syntax.Ast, backward: bool) res[Prog, synta
         if (!c.failed) {
             prefix(?p);
             firsts(?c, a);
+            inner(?c);
         }
     }
     if (!c.failed) { classify(?p); }
@@ -383,6 +384,82 @@ fun add_firsts(bytes: *u8, count: u32, lo: u8, hi: u8) u32 {
         b = b + 1;
     }
     ret n;
+}
+
+# a literal every match contains, when neither a prefix nor first bytes let a
+# search skip and no match can span a newline
+#
+# it is the longest run of plain literals in the pattern's top concatenation,
+# cut to sixteen bytes. a search then skips to the line of its next occurrence,
+# since every match lies within one line and contains it.
+fun inner(c: *Compiler) {
+    val p: *Prog = c.prog;
+    p.inner_len = 0;
+    if (p.prefix_len > 0 || p.first_count > 0) { ret; }
+    # no byte a match reads may be a newline
+    var k: usize = 0;
+    for (k < p.insts.len) {
+        val i: Inst = p.insts.data[k];
+        if (sel i.range) {
+            if (i.range.lo <= '\n' && i.range.hi >= '\n') { ret; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < p.trans.len) {
+        if (p.trans.data[k].lo <= '\n' && p.trans.data[k].hi >= '\n') { ret; }
+        k = k + 1;
+    }
+    var root: usize = c.tree.root;
+    for {
+        val n: Node = c.tree.nodes.data[root];
+        if (sel n.capture) {
+            root = n.capture.sub;
+            cnt;
+        }
+        brk;
+    }
+    val top: Node = c.tree.nodes.data[root];
+    if (!(sel top.concat)) { ret; }
+    var run:  [16]u8;
+    var len:  u32 = 0;
+    var best: u32 = 0;
+    k = 0;
+    for (k <= top.concat.len) {
+        var plain: bool = false;
+        var cp:    u32  = 0;
+        if (k < top.concat.len) {
+            val n: Node = c.tree.nodes.data[c.tree.kids.data[top.concat.start + k]];
+            if (sel n.literal) {
+                plain = !n.literal.fold;
+                cp    = n.literal.cp;
+            }
+        }
+        if (plain) {
+            var bytes: [4]u8;
+            val count: u32 = utf8.encode(cp, ?bytes[0]);
+            var b:     u32 = 0;
+            for (b < count && len < 16) {
+                run[len] = bytes[b];
+                len      = len + 1;
+                b        = b + 1;
+            }
+        }
+        or {
+            # a run ends here, and the longest so far is kept
+            if (len > best) {
+                var b: u32 = 0;
+                for (b < len) {
+                    p.inner[b] = run[b];
+                    b          = b + 1;
+                }
+                best = len;
+            }
+            len = 0;
+        }
+        k = k + 1;
+    }
+    p.inner_len = best;
 }
 
 fun fail(c: *Compiler, kind: Kind, offset: usize) {
@@ -1208,5 +1285,26 @@ test compile__first_bytes {
     open(?c, "x*");
     if (!c.ok || c.prog.first_count != 0) { ret 13; }
     if (!close(?c))                       { ret 14; }
+    ret 0;
+}
+
+test compile__inner_literal {
+    var c: Compiled;
+    open(?c, ".*.*=.*");
+    if (!c.ok || c.prog.inner_len != 1 || c.prog.inner[0] != '=') { ret 1; }
+    if (!close(?c))                                               { ret 2; }
+    open(?c, "\\w+@example\\.com");
+    if (!c.ok || c.prog.inner_len != 12 || c.prog.inner[0] != '@' || c.prog.inner[11] != 'm') { ret 3; }
+    if (!close(?c))                                                                           { ret 4; }
+    # a match that can span a newline, an alternation at the top, or a prefix leave none
+    open(?c, "\\s+=");
+    if (!c.ok || c.prog.inner_len != 0) { ret 5; }
+    if (!close(?c))                     { ret 6; }
+    open(?c, ".*=|x");
+    if (!c.ok || c.prog.inner_len != 0) { ret 7; }
+    if (!close(?c))                     { ret 8; }
+    open(?c, "ab.*=");
+    if (!c.ok || c.prog.inner_len != 0 || c.prog.prefix_len != 2) { ret 9; }
+    if (!close(?c))                                               { ret 10; }
     ret 0;
 }

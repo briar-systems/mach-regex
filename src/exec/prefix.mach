@@ -46,7 +46,7 @@ fun scan(text: View, from: usize, b: u8) usize {
 # p:   the program
 # ret: whether it has a required prefix or a small set of first bytes
 pub fun skips(p: *Prog) bool {
-    ret p.prefix_len > 0 || p.first_count > 0;
+    ret p.prefix_len > 0 || p.first_count > 0 || p.inner_len > 0;
 }
 
 # the first position at or after from holding any of two or three bytes, or the text's length
@@ -111,23 +111,22 @@ fun scan_any(text: View, from: usize, p: *Prog) usize {
     ret at;
 }
 
-# find the first position at or after from where the program's prefix begins,
+# find the first position at or after from where a literal of n bytes begins,
 # scanning for its rarest byte
-fun literal(p: *Prog, text: View, from: usize, at: *usize) bool {
-    val n:    usize = p.prefix_len::usize;
+fun find(needle: *u8, n: usize, text: View, from: usize, at: *usize) bool {
     var rare: usize = 0;
     var k:    usize = 1;
     for (k < n) {
-        if (program.RANK[p.prefix[k]] < program.RANK[p.prefix[rare]]) { rare = k; }
+        if (program.RANK[needle[k]] < program.RANK[needle[rare]]) { rare = k; }
         k = k + 1;
     }
     var here: usize = from;
     for (here + n <= text.len) {
-        val hit: usize = scan(text, here + rare, p.prefix[rare]);
+        val hit: usize = scan(text, here + rare, needle[rare]);
         if (hit - rare + n > text.len) { ret false; }
         val start: usize = hit - rare;
         k = 0;
-        for (k < n && text.data[start + k] == p.prefix[k]) { k = k + 1; }
+        for (k < n && text.data[start + k] == needle[k]) { k = k + 1; }
         if (k == n) {
             @at = start;
             ret true;
@@ -145,7 +144,15 @@ fun literal(p: *Prog, text: View, from: usize, at: *usize) bool {
 # at:   where a match could begin, when there is such a place
 # ret:  whether there is one
 pub fun candidate(p: *Prog, text: View, from: usize, at: *usize) bool {
-    if (p.prefix_len > 0) { ret literal(p, text, from, at); }
+    if (p.prefix_len > 0) { ret find(?p.prefix[0], p.prefix_len::usize, text, from, at); }
+    if (p.first_count == 0) {
+        # no match spans a line, so none begins before the line of the literal's next occurrence
+        var hit: usize = 0;
+        if (!find(?p.inner[0], p.inner_len::usize, text, from, ?hit)) { ret false; }
+        for (hit > from && text.data[hit - 1] != '\n') { hit = hit - 1; }
+        @at = hit;
+        ret true;
+    }
     var here: usize = 0;
     if (p.first_count == 1) { here = scan(text, from, p.firsts[0]); }
     or                      { here = scan_any(text, from, p); }
@@ -207,5 +214,14 @@ test candidate__many_first_bytes {
     if (next_in(sixteen, text, 19) != 33) { ret 5; }
     # seventeen first bytes are too many to skip by
     if (next_in("A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P|Q", "xxA", 0) != 3) { ret 6; }
+    ret 0;
+}
+
+test candidate__line_of_the_inner_literal {
+    # the line holding the first = begins at 4, and a search from inside it stays put
+    if (next_in(".*.*=.*", "abc\nxyz=q\n=", 0) != 4)  { ret 1; }
+    if (next_in(".*.*=.*", "abc\nxyz=q\n=", 6) != 6)  { ret 2; }
+    if (next_in(".*.*=.*", "abc\nxyz=q\n=", 9) != 10) { ret 3; }
+    if (next_in(".*.*=.*", "abc\nxyz", 0) != 7)       { ret 4; }
     ret 0;
 }
