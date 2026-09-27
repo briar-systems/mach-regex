@@ -22,7 +22,7 @@ Regular expressions for Mach with RE2's syntax and semantics.
 Add the dependency to a project:
 
 ```sh
-mach dep add . regex --git https://github.com/briar-systems/mach-regex --version ^0.1
+mach dep add . regex --git https://github.com/briar-systems/mach-regex --version ^0.2
 ```
 
 and import it with `use regex;`, the one module everything is reached through:
