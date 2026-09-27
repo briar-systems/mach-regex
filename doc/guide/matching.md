@@ -63,10 +63,11 @@ While no match is in progress, a search skips ahead when it can. A pattern
 whose every match begins with the same literal bytes, as `hello` in
 `hello\s+world`, is searched by scanning sixteen bytes at a time for the rarest
 of those bytes, by how common each byte is in typical text, and checking the
-rest around it. One whose every match begins with one of at most three bytes,
-as `(?i)sherlock` begins with `S`, `s` or the first byte of `ſ`, is searched by
-scanning for any of them. A search stops skipping when the places it skips to
-keep turning out close together.
+rest around it. One whose every match begins with one of at most sixteen
+bytes, as `(?i)sherlock` begins with `S`, `s` or the first byte of `ſ` and
+`Holmes|Watson|Adler` with `H`, `W` or `A`, is searched by comparing sixteen
+bytes at a time with each of them. A search stops skipping when the places it
+skips to keep turning out close together.
 
 `captures` needs only the groups of a match whose bounds the DFA has found. A
 one-pass pattern, one where at every step at most one way of matching can
