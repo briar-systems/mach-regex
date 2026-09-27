@@ -44,15 +44,30 @@ and nothing more.
 ## Cost
 
 Every search takes time proportional to the size of the compiled pattern times
-the length of the text searched, whatever the pattern and whatever the text.
-The engine runs every way the pattern could match in step, keeping at most one
-thread per instruction, and never backtracks, so no pattern can make a search
-run away: `(a*)*b` against a long run of `a` fails in one pass. This is what
-rules out the syntax RE2 leaves out, as the [syntax](syntax.md) guide explains.
+the length of the text searched, whatever the pattern and whatever the text. No
+engine here tries the same way of matching twice at the same place, so no
+pattern can make a search run away: `(a*)*b` against a long run of `a` fails in
+one pass. This is what rules out the syntax RE2 leaves out, as the
+[syntax](syntax.md) guide explains.
+
+A search runs a lazy DFA. As the text calls for them, it builds states that
+each stand for every way the pattern could be matching at once, so reading a
+byte soon becomes a single table lookup. It reads forward to where the leftmost
+match ends, then runs a reversed copy of the pattern backward from there to
+where the match begins. Its states live in a fixed arena in the `Cache`. A
+pattern that needs more states than the arena holds too often makes the search
+fall back to a Pike VM, which runs every way of matching in step with at most
+one thread per instruction.
 
 A pattern whose every match begins with the same literal bytes, as `hello` in
 `hello\s+world`, is searched faster: while no match is in progress, the search
 skips to the next place those bytes occur, scanning sixteen bytes at a time.
+
+`captures` needs only the groups of a match whose bounds the DFA has found. A
+one-pass pattern, one where at every step at most one way of matching can
+still go on, is compiled once more into a table that resolves them in a single
+pass, as RE2 and Rust do. Any other pattern runs the Pike VM from where the
+match begins. Either way the result is the one the Pike VM alone would give.
 
 Compiling allocates through the allocator it is given. A search runs entirely
 in its `Cache` and allocates nothing.

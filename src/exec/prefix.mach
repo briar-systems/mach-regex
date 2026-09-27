@@ -1,0 +1,55 @@
+# finding where a program's required prefix next begins
+#
+# a search with no thread alive can skip to the next place the prefix every
+# match begins with occurs, scanning for its first byte sixteen bytes at a time.
+
+use std.math.bits;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.view.View;
+
+use regex.compile.program.Prog;
+
+# the first position at or after from holding a byte, or the text's length
+fun scan(text: View, from: usize, b: u8) usize {
+    val needle: u8x16 = u8x16{b, b, b, b, b, b, b, b, b, b, b, b, b, b, b, b};
+    var at:     usize = from;
+    for (at + 16 <= text.len) {
+        val chunk: u8x16 = text.data[at, 16]::u8x16;
+        val hits:  u64x2 = (chunk == needle):~u64x2;
+        # lane 0 is the lowest byte, so the first hit is the lowest set byte
+        val low: u64 = hits[0];
+        if (low != 0) { ret at + (bits.ctz(low) / 8)::usize; }
+        val high: u64 = hits[1];
+        if (high != 0) { ret at + 8 + (bits.ctz(high) / 8)::usize; }
+        at = at + 16;
+    }
+    for (at < text.len && text.data[at] != b) { at = at + 1; }
+    ret at;
+}
+
+# find the first position at or after from where the program's prefix begins
+# ---
+# p:    a program with a required prefix
+# text: the text
+# from: where to look from
+# at:   where the prefix begins, when it is found
+# ret:  whether the prefix occurs at or after from
+pub fun candidate(p: *Prog, text: View, from: usize, at: *usize) bool {
+    val n:    usize = p.prefix_len::usize;
+    var here: usize = from;
+    for (here + n <= text.len) {
+        here = scan(text, here, p.prefix[0]);
+        if (here + n > text.len) { ret false; }
+        var k: usize = 1;
+        for (k < n && text.data[here + k] == p.prefix[k]) { k = k + 1; }
+        if (k == n) {
+            @at = here;
+            ret true;
+        }
+        here = here + 1;
+    }
+    ret false;
+}
