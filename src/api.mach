@@ -24,6 +24,7 @@ use std.types.view.view;
 
 use program: regex.compile;
 use regex.compile.Prog;
+use regex.exec.backtrack;
 use regex.exec.pikevm;
 use regex.syntax;
 use regex.syntax.Error;
@@ -76,8 +77,10 @@ pub rec Regex {
 # the scratch of searching with one Regex
 # ---
 # vm: the pike vm's scratch
+# bt: the bounded backtracker's scratch
 pub rec Cache {
     vm: pikevm.Cache;
+    bt: backtrack.Cache;
 }
 
 # where a search for successive matches has reached
@@ -164,6 +167,10 @@ pub fun error_text(e: Error) str {
 pub fun cache(a: *A.Allocator, re: *Regex) res[Cache, Error] {
     var c: Cache;
     if (!pikevm.init(a, ?re.prog, ?c.vm)) { ret res[Cache, Error].err{Error{kind: Kind.memory{}, offset: 0}}; }
+    if (!backtrack.init(a, ?re.prog, ?c.bt)) {
+        pikevm.dnit(?c.vm);
+        ret res[Cache, Error].err{Error{kind: Kind.memory{}, offset: 0}};
+    }
     ret res[Cache, Error].ok{c};
 }
 
@@ -172,6 +179,7 @@ pub fun cache(a: *A.Allocator, re: *Regex) res[Cache, Error] {
 # c: the Cache
 pub fun cache_dnit(c: *Cache) {
     pikevm.dnit(?c.vm);
+    backtrack.dnit(?c.bt);
 }
 
 # the number of capturing groups, not counting the whole match
@@ -270,7 +278,10 @@ pub fun find(re: *Regex, c: *Cache, text: View, from: usize) opt[Match] {
 # ret:   whether there is a match
 pub fun captures(re: *Regex, c: *Cache, text: View, from: usize, slots: *usize) bool {
     if (from > text.len) { ret false; }
-    ret pikevm.search(?re.prog, ?c.vm, text, aligned(text, from), false, re.longest, slot_count(re), slots);
+    val start: usize = aligned(text, from);
+    # a short enough rest of the text goes to the backtracker, which resolves captures faster
+    if (backtrack.fits(?re.prog, text.len - start)) { ret backtrack.search(?re.prog, ?c.bt, text, start, false, re.longest, slot_count(re), slots); }
+    ret pikevm.search(?re.prog, ?c.vm, text, start, false, re.longest, slot_count(re), slots);
 }
 
 # a search for successive matches from the start of a text
