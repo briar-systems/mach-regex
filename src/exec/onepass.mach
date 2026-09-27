@@ -171,12 +171,25 @@ fun state_of(b: *Build, pc: u32) u32 {
     val id: u32 = b.pcs.len::u32;
     b.state.data[pc] = id;
     grow[u32](b, ?b.pcs, pc);
-    val none: Entry = Entry{next: DEAD, looks: 0, after: 0, saves: 0};
-    var k:    usize = 0;
-    for (k < b.op.stride && !b.failed) {
-        grow[Entry](b, ?b.op.table, none);
-        k = k + 1;
+    # a row at a time, doubling, rather than an entry at a time
+    val t:    *Vector[Entry] = ?b.op.table;
+    val need: usize          = t.len + b.op.stride;
+    if (need > t.cap) {
+        var room: usize = t.cap * 2;
+        if (room < need) { room = need; }
+        val grown: res[usize, A.Error] = vector.ensure[Entry](t, room);
+        if (sel grown.err) {
+            b.failed = true;
+            ret DEAD;
+        }
     }
+    val none: Entry = Entry{next: DEAD, looks: 0, after: 0, saves: 0};
+    var k:    usize = t.len;
+    for (k < need) {
+        t.data[k] = none;
+        k         = k + 1;
+    }
+    t.len = need;
     ret id;
 }
 
