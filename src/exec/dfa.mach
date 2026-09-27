@@ -152,16 +152,10 @@ pub rec Dfa {
     since:    usize;
 }
 
-# grow a vector to n zeroed elements
+# grow a vector to n elements, left as they are, since every one is written before it is read
 fun sized[T](v: *Vector[T], n: usize) bool {
     val grown: res[usize, A.Error] = vector.ensure[T](v, n);
     if (sel grown.err) { ret false; }
-    var zero: T;
-    var k:    usize = 0;
-    for (k < n) {
-        v.data[k] = zero;
-        k         = k + 1;
-    }
     v.len = n;
     ret true;
 }
