@@ -627,12 +627,19 @@ pub fun forward(d: *Dfa, p: *Prog, text: View, from: usize, earliest: bool) Outc
     var h:       u32   = start(d, p, context_at(d, text, from - 1, from == 0), false);
     var last:    usize = NONE;
     var at:      usize = from;
+    var skip:    bool  = prefix.skips(p);
+    var tries:   usize = 0;
+    var gained:  usize = 0;
     if (h == UNKNOWN) { ret Outcome.gave_up{}; }
     for {
-        # with no thread alive, no match can begin before the prefix's next occurrence
-        if ((h & IDLE) != 0 && p.prefix_len > 0) {
+        # with no thread alive, no match can begin before the next place one could
+        if ((h & IDLE) != 0 && skip) {
             var next: usize = 0;
             if (!prefix.candidate(p, text, at, ?next)) { brk; }
+            # a skip that keeps landing close by costs more than it saves
+            tries  = tries + 1;
+            gained = gained + (next - at);
+            if (tries >= 32 && gained < tries * 16) { skip = false; }
             if (next != at) {
                 at = next;
                 h  = start(d, p, context_at(d, text, at - 1, false), false);
