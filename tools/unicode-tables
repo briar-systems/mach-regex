@@ -153,6 +153,7 @@ def render_classes():
     lines += [
         'use std.types.string.str;',
         '',
+        '# number of classes',
         f'pub val COUNT: u32 = {len(names)};',
         '',
         '# class names, sorted by byte',
@@ -191,6 +192,7 @@ def render_folds():
         pairs += [cp, step[cp]]
     lines = header('simple case folding orbits')
     lines += [
+        '# number of folding code points',
         f'pub val COUNT: u32 = {len(step)};',
         '',
         '# code point, next in its orbit: sorted by code point, one per folding code point',

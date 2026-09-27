@@ -5,6 +5,7 @@
 
 use std.types.string.str;
 
+# number of classes
 pub val COUNT: u32 = 214;
 
 # class names, sorted by byte
