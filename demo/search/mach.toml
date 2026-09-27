@@ -1,0 +1,69 @@
+[project]
+id = "search"
+version = "0.1.0"
+mach = "^6"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[target.linux-aarch64]
+isa = "aarch64"
+os  = "linux"
+abi = "aapcs64"
+
+[target.windows-x86_64]
+isa = "x86_64"
+os  = "windows"
+abi = "win64"
+
+[target.darwin-x86_64]
+isa = "x86_64"
+os  = "darwin"
+abi = "sysv64"
+
+[target.darwin-aarch64]
+isa = "aarch64"
+os  = "darwin"
+abi = "aapcs64"
+
+[artifact.search]
+kind = "bin"
+entry = "bin/search.mach"
+out = "bin/search{artifact.suffix}"
+targets = ["*"]
+link = ["kernel32"]
+need = []
+
+[link.kernel32]
+source = "system"
+name = "kernel32.dll"
+os = ["windows"]
+isa = ["*"]
+abi = ["*"]
+export = false
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+# the library from this checkout, and std through the library's own pin
+[dep.regex]
+path = "../.."
+
+[dep.std]
+path = "../../dep/std"
