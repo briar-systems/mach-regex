@@ -1,0 +1,61 @@
+name: Release
+
+# a pushed `v*` tag that matches the manifest version runs every CI leg, then
+# publishes a github release with every target's binary attached and notes
+# generated from the merged pull requests.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("mach.toml", "rb"))["project"]["version"])')
+          [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG does not match mach.toml version $version"; exit 1; }
+
+  ci:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+    with:
+      heavy: all
+
+  publish:
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # a doubled tag push waits on the concurrency group, then finds the release
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists"
+            exit 0
+          fi
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* --verify-tag --title "$TAG" --generate-notes "${flags[@]}"

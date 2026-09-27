@@ -1,0 +1,148 @@
+name: CI
+
+# a pull request into dev runs the light legs, a pull request into main runs
+# every leg, and a dispatch can ask for every leg on any ref. `gate` is the one
+# required check, so every job must be in its needs.
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      heavy:
+        type: string
+        default: none
+  workflow_dispatch:
+    inputs:
+      heavy:
+        description: run the heavy legs on this ref
+        type: choice
+        default: none
+        options: [none, all]
+
+permissions:
+  contents: read
+
+env:
+  MACH_VERSION: v5.10.0
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      legs: ${{ steps.plan.outputs.legs }}
+    steps:
+      - id: plan
+        env:
+          HEAVY: ${{ github.base_ref == 'main' && 'all' || inputs.heavy || 'none' }}
+          # the first leg is light and also checks formatting and every target
+          LEGS: |
+            [
+              { "name": "x86_64-linux",   "runs-on": "ubuntu-latest",    "tier": "light" },
+              { "name": "aarch64-linux",  "runs-on": "ubuntu-24.04-arm", "tier": "heavy" },
+              { "name": "x86_64-windows", "runs-on": "windows-latest",   "tier": "heavy" },
+              { "name": "aarch64-darwin", "runs-on": "macos-15",         "tier": "heavy" },
+              { "name": "x86_64-darwin",  "runs-on": "macos-15-intel",   "tier": "heavy" }
+            ]
+        run: |
+          set -euo pipefail
+          legs=$(jq -c --arg heavy "$HEAVY" \
+            '[to_entries[] | .value + {primary: (.key == 0)} | select(.tier == "light" or $heavy == "all")]' <<< "$LEGS")
+          echo "legs=$legs" >> "$GITHUB_OUTPUT"
+          jq -r '.[] | "\(.name) (\(.tier))"' <<< "$legs"
+
+  build:
+    name: ${{ matrix.leg.name }}
+    needs: plan
+    runs-on: ${{ matrix.leg.runs-on }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.plan.outputs.legs) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - name: install mach
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS/$RUNNER_ARCH" in
+            Linux/X64)   host=x86_64-linux;   ext=tar.gz ;;
+            Linux/ARM64) host=aarch64-linux;  ext=tar.gz ;;
+            macOS/X64)   host=x86_64-darwin;  ext=tar.gz ;;
+            macOS/ARM64) host=aarch64-darwin; ext=tar.gz ;;
+            Windows/X64) host=x86_64-windows; ext=zip ;;
+          esac
+          asset="mach-${MACH_VERSION#v}-$host.$ext"
+          dir="$RUNNER_TEMP/mach"
+          gh release download "$MACH_VERSION" -R briar-systems/mach -p "$asset" -p SHA256SUMS -D "$dir"
+          # verify before extracting anything
+          if command -v sha256sum > /dev/null; then sum="sha256sum"; else sum="shasum -a 256"; fi
+          (cd "$dir" && awk -v a="$asset" '$2 == a' SHA256SUMS | $sum -c -)
+          case "$ext" in
+            zip) pwsh -NoProfile -Command "Expand-Archive -Path '$dir/$asset' -DestinationPath '$dir'" ;;
+            *)   tar -xzf "$dir/$asset" -C "$dir" ;;
+          esac
+          echo "$dir" >> "$GITHUB_PATH"
+      - run: mach dep pull .
+      - run: mach build . --profile debug
+      - run: mach build . --profile release
+      - run: mach test . --profile debug
+      - run: mach test . --profile release
+      - if: matrix.leg.primary
+        run: mach fmt --check .
+      - if: matrix.leg.primary
+        run: mach build . --all-targets --profile release
+      # a release run packages every executable for cd.yml, at the paths mach's
+      # build plan reports, so artifact names and suffixes come from mach.toml
+      - name: package
+        if: matrix.leg.primary && github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          mkdir dist
+          mach build . --all-targets --profile release --plan | awk '
+            /^unit / { name = $3; target = $6; goal = ""; os = "" }
+            $1 == "goal" { goal = $2 }
+            $1 == "tuple" { split($2, t, "-"); os = t[2] }
+            $1 == "out" && goal == "executable" { print name, target, os, $2 }' |
+          while read -r name target os path; do
+            archive="$PWD/dist/$name-$version-$target"
+            case "$os" in
+              windows) (cd "$(dirname "$path")" && zip -q "$archive.zip" "$(basename "$path")") ;;
+              *)       tar -czf "$archive.tar.gz" -C "$(dirname "$path")" "$(basename "$path")" ;;
+            esac
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls dist
+      - if: matrix.leg.primary && github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  gate:
+    if: always()
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/workflows
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"
+          # a job left out of needs would never be checked
+          jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/ci.yml)
+          missing=$(grep -vx gate <<< "$jobs" | grep -vxF -f <(jq -r 'keys[]' <<< "$NEEDS") || true)
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key' <<< "$NEEDS")
+          [ -z "$missing" ] || echo "::error::gate does not need: $missing"
+          [ -z "$failed" ] || echo "::error::failed: $failed"
+          [ -z "$missing$failed" ]
