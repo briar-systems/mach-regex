@@ -1,0 +1,152 @@
+# code point ranges as utf-8 byte sequences
+#
+# a range of code points is split until each piece encodes as one sequence of
+# byte ranges, one range per position: at the boundaries where the encoded
+# length changes, where continuation bytes would not all be covered, and
+# around the surrogates, which utf-8 never encodes. the pieces come out in
+# code point order, which is also the byte order of their encodings. this is
+# the split regex-syntax's Utf8Sequences makes.
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+
+# a sequence of byte ranges, one per encoded byte
+# ---
+# len: how many bytes, 1 to 4
+# lo:  the first byte at each position
+# hi:  the last byte at each position
+pub rec Seq {
+    len: u32;
+    lo:  [4]u8;
+    hi:  [4]u8;
+}
+
+# the encoded length of a code point
+fun length(cp: u32) u32 {
+    if (cp <= 0x7F)   { ret 1; }
+    if (cp <= 0x7FF)  { ret 2; }
+    if (cp <= 0xFFFF) { ret 3; }
+    ret 4;
+}
+
+# encode a code point into out, which holds 4 bytes, giving its length
+# ---
+# cp:  a code point, not a surrogate
+# out: the first of 4 bytes to write
+# ret: how many bytes it takes
+pub fun encode(cp: u32, out: *u8) u32 {
+    val n: u32 = length(cp);
+    if (n == 1) {
+        out[0] = cp::u8;
+    }
+    or (n == 2) {
+        out[0] = (0xC0 | (cp >> 6))::u8;
+        out[1] = (0x80 | (cp & 0x3F))::u8;
+    }
+    or (n == 3) {
+        out[0] = (0xE0 | (cp >> 12))::u8;
+        out[1] = (0x80 | ((cp >> 6) & 0x3F))::u8;
+        out[2] = (0x80 | (cp & 0x3F))::u8;
+    }
+    or {
+        out[0] = (0xF0 | (cp >> 18))::u8;
+        out[1] = (0x80 | ((cp >> 12) & 0x3F))::u8;
+        out[2] = (0x80 | ((cp >> 6) & 0x3F))::u8;
+        out[3] = (0x80 | (cp & 0x3F))::u8;
+    }
+    ret n;
+}
+
+# append the sequences of a code point range, in order
+# ---
+# lo:  the first code point
+# hi:  the last code point
+# out: where the sequences go
+# ret: false when the allocator refuses
+pub fun sequences(lo: u32, hi: u32, out: *Vector[Seq]) bool {
+    # pending pieces, each a start and an end, the next to take last
+    var starts: [16]u32;
+    var ends:   [16]u32;
+    var top:    usize = 1;
+    starts[0] = lo;
+    ends[0]   = hi;
+    for (top > 0) {
+        top = top - 1;
+        var s: u32 = starts[top];
+        var e: u32 = ends[top];
+        for {
+            if (s > e) { brk; }
+            # the surrogates are not code points utf-8 encodes
+            if (s <= 0xDFFF && e >= 0xD800) {
+                if (e > 0xDFFF) {
+                    starts[top] = 0xE000;
+                    ends[top]   = e;
+                    top         = top + 1;
+                }
+                if (s >= 0xD800) { brk; }
+                e = 0xD7FF;
+                cnt;
+            }
+            # a piece encodes at one length only
+            if (s <= 0x7F && e > 0x7F) {
+                starts[top] = 0x80;
+                ends[top]   = e;
+                top         = top + 1;
+                e           = 0x7F;
+                cnt;
+            }
+            if (s <= 0x7FF && e > 0x7FF) {
+                starts[top] = 0x800;
+                ends[top]   = e;
+                top         = top + 1;
+                e           = 0x7FF;
+                cnt;
+            }
+            if (s <= 0xFFFF && e > 0xFFFF) {
+                starts[top] = 0x10000;
+                ends[top]   = e;
+                top         = top + 1;
+                e           = 0xFFFF;
+                cnt;
+            }
+            # every continuation position below a split covers all of 80-BF
+            var split: bool = false;
+            var i:     u32  = 1;
+            for (i < 4 && !split) {
+                val m: u32 = (1::u32 << (6 * i)) - 1;
+                if ((s & ~m) != (e & ~m)) {
+                    if ((s & m) != 0) {
+                        starts[top] = (s | m) + 1;
+                        ends[top]   = e;
+                        top         = top + 1;
+                        e           = s | m;
+                        split       = true;
+                    }
+                    or ((e & m) != m) {
+                        starts[top] = e & ~m;
+                        ends[top]   = e;
+                        top         = top + 1;
+                        e           = (e & ~m) - 1;
+                        split       = true;
+                    }
+                }
+                i = i + 1;
+            }
+            if (split) { cnt; }
+            var a: [4]u8;
+            var b: [4]u8;
+            val n: u32 = encode(s, ?a[0]);
+            encode(e, ?b[0]);
+            val pushed: res[usize, A.Error] = vector.push[Seq](out, Seq{len: n, lo: a, hi: b});
+            if (sel pushed.err) { ret false; }
+            brk;
+        }
+    }
+    ret true;
+}

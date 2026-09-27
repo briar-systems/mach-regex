@@ -1,0 +1,25 @@
+# compiling a parsed pattern to the byte program every engine runs
+#
+# the program is the contract between the compiler and the matching engines:
+# instructions over bytes with explicit successors, code points as utf-8
+# sequences, and capture slots two per group.
+
+use regex.compile.compiler;
+use prog: regex.compile.program;
+use regex.compile.utf8;
+
+fwd compiler.compile;
+fwd compiler.MAX_INSTS;
+fwd prog.Assert;
+fwd prog.Inst;
+fwd prog.Look;
+fwd prog.Prog;
+fwd prog.Save;
+fwd prog.Sparse;
+fwd prog.Split;
+fwd prog.Trans;
+fwd prog.dnit;
+fwd prog.size;
+fwd utf8.Seq;
+fwd utf8.encode;
+fwd utf8.sequences;

@@ -1,0 +1,866 @@
+# parse RE2 syntax into an Ast
+#
+# a recursive descent over the pattern's utf-8, alternation above
+# concatenation above repetition above atoms, with every error located at the
+# byte where its offending text begins. unicode class names stay symbolic, and
+# perl and posix classes resolve to ascii ranges here. nesting is bounded at
+# 1000 groups and repetition bounds at 1000, as in RE2.
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+use std.types.view.view;
+
+use regex.syntax.errors.Error;
+use regex.syntax.errors.Kind;
+use ast: regex.syntax.tree;
+use regex.syntax.tree.Ast;
+use regex.syntax.tree.Capture;
+use regex.syntax.tree.Class;
+use regex.syntax.tree.Flags;
+use regex.syntax.tree.Item;
+use regex.syntax.tree.Literal;
+use regex.syntax.tree.Node;
+use regex.syntax.tree.Range;
+use regex.syntax.tree.Repeat;
+use regex.syntax.tree.Set;
+use regex.syntax.tree.Span;
+use regex.syntax.tree.Unicode;
+
+# the largest repetition bound
+val MAX_REPEAT: u32 = 1000;
+
+# the deepest groups may nest
+val MAX_DEPTH: usize = 1000;
+
+# the largest code point
+val MAX_CP: u32 = 0x10FFFF;
+
+# what an atom returns when it produced no node, as a flag group does
+val NONE: usize = 0xFFFFFFFFFFFFFFFF;
+
+val DIGIT: [1]Range = [1]Range{Range{lo: '0', hi: '9'}};
+val SPACE: [3]Range = [3]Range{Range{lo: '\t', hi: '\n'}, Range{lo: 12, hi: '\r'}, Range{lo: ' ', hi: ' '}};
+val WORD:  [4]Range = [4]Range{Range{lo: '0', hi: '9'}, Range{lo: 'A', hi: 'Z'}, Range{lo: '_', hi: '_'}, Range{lo: 'a', hi: 'z'}};
+
+val ALNUM:  [3]Range = [3]Range{Range{lo: '0', hi: '9'}, Range{lo: 'A', hi: 'Z'}, Range{lo: 'a', hi: 'z'}};
+val ALPHA:  [2]Range = [2]Range{Range{lo: 'A', hi: 'Z'}, Range{lo: 'a', hi: 'z'}};
+val ASCII:  [1]Range = [1]Range{Range{lo: 0, hi: 0x7F}};
+val BLANK:  [2]Range = [2]Range{Range{lo: '\t', hi: '\t'}, Range{lo: ' ', hi: ' '}};
+val CNTRL:  [2]Range = [2]Range{Range{lo: 0, hi: 0x1F}, Range{lo: 0x7F, hi: 0x7F}};
+val GRAPH:  [1]Range = [1]Range{Range{lo: '!', hi: '~'}};
+val LOWER:  [1]Range = [1]Range{Range{lo: 'a', hi: 'z'}};
+val PRINT:  [1]Range = [1]Range{Range{lo: ' ', hi: '~'}};
+val PUNCT:  [4]Range = [4]Range{Range{lo: '!', hi: '/'}, Range{lo: ':', hi: '@'}, Range{lo: '[', hi: '`'}, Range{lo: '{', hi: '~'}};
+val PSPACE: [2]Range = [2]Range{Range{lo: '\t', hi: '\r'}, Range{lo: ' ', hi: ' '}};
+val UPPER:  [1]Range = [1]Range{Range{lo: 'A', hi: 'Z'}};
+val XDIGIT: [3]Range = [3]Range{Range{lo: '0', hi: '9'}, Range{lo: 'A', hi: 'F'}, Range{lo: 'a', hi: 'f'}};
+
+# a table of ranges named by a perl or posix class
+# ---
+# ranges: the first range
+# len:    number of ranges
+rec Table {
+    ranges: *Range;
+    len:    usize;
+}
+
+# the state of one parse
+# ---
+# s:      the pattern
+# i:      offset of the next byte
+# ast:    the tree being built
+# flags:  the flags in force here
+# depth:  how deep the open groups nest
+# stack:  the items of the open concatenations and alternations
+# lits:   the literal ranges of the class being parsed
+# items:  the members of the class being parsed
+# failed: an error was recorded
+# err:    the first error
+rec Parser {
+    s:      View;
+    i:      usize;
+    ast:    *Ast;
+    flags:  Flags;
+    depth:  usize;
+    stack:  Vector[usize];
+    lits:   Vector[Range];
+    items:  Vector[Item];
+    failed: bool;
+    err:    Error;
+}
+
+# parse a pattern
+#
+# names and unicode class names in the Ast borrow the pattern's bytes.
+# ---
+# a:       the allocator the Ast grows in
+# pattern: the pattern's utf-8
+# flags:   the flags in force at the start
+# literal: the whole pattern is literal text, with no operators
+# ret:     the Ast, or the first error
+pub fun parse(a: *A.Allocator, pattern: View, flags: Flags, literal: bool) res[Ast, Error] {
+    var tree: Ast    = ast.init(a);
+    var p:    Parser = Parser{
+        s:     pattern,
+        i:     0,
+        ast:   ?tree,
+        flags: flags,
+        stack: vector.init[usize](a),
+        lits:  vector.init[Range](a),
+        items: vector.init[Item](a),
+    };
+    fin {
+        vector.dnit[usize](?p.stack);
+        vector.dnit[Range](?p.lits);
+        vector.dnit[Item](?p.items);
+    }
+
+    # index 0 names the whole match
+    put[View](?p, ?tree.names, view(nil, 0));
+    if (literal) {
+        tree.root = literal_text(?p);
+    }
+    or {
+        tree.root = alternation(?p);
+        if (!p.failed && p.i < p.s.len) { fail(?p, Kind.unexpected_paren{}, p.i); }
+    }
+    if (p.failed) {
+        ast.dnit(?tree);
+        ret res[Ast, Error].err{p.err};
+    }
+    ret res[Ast, Error].ok{tree};
+}
+
+# record the first error
+fun fail(p: *Parser, kind: Kind, offset: usize) {
+    if (p.failed) { ret; }
+    p.failed = true;
+    p.err    = Error{kind: kind, offset: offset};
+}
+
+# append to a vector, recording a refusal as an error
+fun put[T](p: *Parser, v: *Vector[T], x: T) bool {
+    val pushed: res[usize, A.Error] = vector.push[T](v, x);
+    if (sel pushed.err) {
+        fail(p, Kind.memory{}, p.i);
+        ret false;
+    }
+    ret true;
+}
+
+# add a node, giving its index
+fun add(p: *Parser, n: Node) usize {
+    if (!put[Node](p, ?p.ast.nodes, n)) { ret 0; }
+    ret p.ast.nodes.len - 1;
+}
+
+fun literal(p: *Parser, cp: u32) usize {
+    ret add(p, Node.literal{Literal{cp: cp, fold: p.flags.fold}});
+}
+
+fun more(p: *Parser) bool {
+    ret p.i < p.s.len;
+}
+
+# the byte k past the next, or 0 past the end
+fun peek_at(p: *Parser, k: usize) u8 {
+    if (p.i + k >= p.s.len) { ret 0; }
+    ret p.s.data[p.i + k];
+}
+
+fun peek(p: *Parser) u8 {
+    ret peek_at(p, 0);
+}
+
+fun is_alnum(c: u8) bool {
+    ret (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+fun is_word(c: u8) bool {
+    ret is_alnum(c) || c == '_';
+}
+
+fun is_octal(c: u8) bool {
+    ret c >= '0' && c <= '7';
+}
+
+# the value of a hex digit, or 16 for any other byte
+fun hex(c: u8) u32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::u32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::u32 + 10; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::u32 + 10; }
+    ret 16;
+}
+
+# consume the code point at the next byte
+fun rune(p: *Parser) u32 {
+    var cp:   utf8.Codepoint = 0;
+    val used: usize          = utf8.decode(?p.s.data[p.i], p.s.len - p.i, ?cp);
+    if (used == 0) {
+        fail(p, Kind.invalid_utf8{}, p.i);
+        ret 0;
+    }
+    p.i = p.i + used;
+    ret cp;
+}
+
+fun equal(a: View, b: View) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# move the stack's entries above base into one node
+fun collect(p: *Parser, base: usize, alternate: bool) usize {
+    val n: usize = p.stack.len - base;
+    if (n == 0) { ret add(p, Node.empty{}); }
+    if (n == 1) {
+        val only: usize = p.stack.data[base];
+        p.stack.len = base;
+        ret only;
+    }
+    val start: usize = p.ast.kids.len;
+    var k:     usize = 0;
+    for (k < n) {
+        if (!put[usize](p, ?p.ast.kids, p.stack.data[base + k])) { ret 0; }
+        k = k + 1;
+    }
+    p.stack.len = base;
+    val span: Span = Span{start: start, len: n};
+    if (alternate) { ret add(p, Node.alternate{span}); }
+    ret add(p, Node.concat{span});
+}
+
+# the whole pattern as literal text
+fun literal_text(p: *Parser) usize {
+    val base: usize = p.stack.len;
+    for (more(p)) {
+        val cp: u32 = rune(p);
+        if (p.failed)                                 { ret 0; }
+        if (!put[usize](p, ?p.stack, literal(p, cp))) { ret 0; }
+    }
+    ret collect(p, base, false);
+}
+
+fun alternation(p: *Parser) usize {
+    val base: usize = p.stack.len;
+    put[usize](p, ?p.stack, concat(p));
+    for (!p.failed && peek(p) == '|') {
+        p.i = p.i + 1;
+        put[usize](p, ?p.stack, concat(p));
+    }
+    if (p.failed) {
+        p.stack.len = base;
+        ret 0;
+    }
+    ret collect(p, base, true);
+}
+
+fun concat(p: *Parser) usize {
+    val base: usize = p.stack.len;
+    for (!p.failed && more(p)) {
+        val c: u8 = peek(p);
+        if (c == '|' || c == ')') { brk; }
+        val item: usize = repetition(p);
+        if (!p.failed && item != NONE) { put[usize](p, ?p.stack, item); }
+    }
+    if (p.failed) {
+        p.stack.len = base;
+        ret 0;
+    }
+    ret collect(p, base, false);
+}
+
+# an atom and the repetition operators after it
+fun repetition(p: *Parser) usize {
+    var sub:      usize = atom(p);
+    var repeated: bool  = false;
+    for (!p.failed && more(p)) {
+        val at:  usize = p.i;
+        val c:   u8    = peek(p);
+        var min: u32   = 0;
+        var max: u32   = 0;
+        if (c == '*') {
+            max = ast.UNBOUNDED;
+            p.i = p.i + 1;
+        }
+        or (c == '+') {
+            min = 1;
+            max = ast.UNBOUNDED;
+            p.i = p.i + 1;
+        }
+        or (c == '?') {
+            max = 1;
+            p.i = p.i + 1;
+        }
+        or (c == '{') {
+            # a brace that is not a valid repetition is a literal, left for the next atom
+            if (!bounds(p, ?min, ?max)) { brk; }
+            if (p.failed)               { ret 0; }
+        }
+        or {
+            brk;
+        }
+        if (sub == NONE) {
+            fail(p, Kind.missing_repeat_argument{}, at);
+            ret 0;
+        }
+        if (repeated) {
+            fail(p, Kind.invalid_repeat_op{}, at);
+            ret 0;
+        }
+        var greedy: bool = !p.flags.ungreedy;
+        if (peek(p) == '?') {
+            p.i    = p.i + 1;
+            greedy = !greedy;
+        }
+        sub      = add(p, Node.repeat{Repeat{sub: sub, min: min, max: max, greedy: greedy}});
+        repeated = true;
+    }
+    ret sub;
+}
+
+# a decimal repetition bound, capped past the limit, or false when there is none
+fun number(p: *Parser, out: *u32) bool {
+    val start: usize = p.i;
+    var n:     u32   = 0;
+    for (more(p) && peek(p) >= '0' && peek(p) <= '9') {
+        if (n <= MAX_REPEAT) { n = n * 10 + (peek(p) - '0')::u32; }
+        p.i = p.i + 1;
+    }
+    if (p.i == start) { ret false; }
+    # a leading zero makes it no repetition at all, as in RE2
+    if (p.i - start > 1 && p.s.data[start] == '0') { ret false; }
+    @out = n;
+    ret true;
+}
+
+# a {n}, {n,} or {n,m} at the next byte, consumed only when it is one
+fun bounds(p: *Parser, min: *u32, max: *u32) bool {
+    val at: usize = p.i;
+    p.i = p.i + 1;
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    if (!number(p, ?lo)) {
+        p.i = at;
+        ret false;
+    }
+    hi = lo;
+    if (peek(p) == ',') {
+        p.i = p.i + 1;
+        hi  = ast.UNBOUNDED;
+        if (peek(p) != '}') {
+            if (!number(p, ?hi)) {
+                p.i = at;
+                ret false;
+            }
+        }
+    }
+    if (peek(p) != '}') {
+        p.i = at;
+        ret false;
+    }
+    p.i = p.i + 1;
+    if (lo > MAX_REPEAT || (hi != ast.UNBOUNDED && (hi > MAX_REPEAT || hi < lo))) {
+        fail(p, Kind.invalid_repeat_size{}, at);
+        ret true;
+    }
+    @min = lo;
+    @max = hi;
+    ret true;
+}
+
+fun atom(p: *Parser) usize {
+    val at: usize = p.i;
+    val c:  u8    = peek(p);
+    if (c == '(')  { ret group(p); }
+    if (c == '[')  { ret class(p); }
+    if (c == '\\') { ret escape(p); }
+    if (c == '.') {
+        p.i = p.i + 1;
+        if (p.flags.dotnl) { ret add(p, Node.any{}); }
+        ret add(p, Node.any_but_newline{});
+    }
+    if (c == '^') {
+        p.i = p.i + 1;
+        if (p.flags.multiline) { ret add(p, Node.begin_line{}); }
+        ret add(p, Node.begin_text{});
+    }
+    if (c == '$') {
+        p.i = p.i + 1;
+        if (p.flags.multiline) { ret add(p, Node.end_line{}); }
+        ret add(p, Node.end_text{});
+    }
+    if (c == '*' || c == '+' || c == '?') {
+        fail(p, Kind.missing_repeat_argument{}, at);
+        ret 0;
+    }
+    if (c == '{') {
+        # a valid repetition has nothing to repeat here, and any other brace is literal
+        var min: u32 = 0;
+        var max: u32 = 0;
+        if (bounds(p, ?min, ?max)) {
+            fail(p, Kind.missing_repeat_argument{}, at);
+            ret 0;
+        }
+        p.i = p.i + 1;
+        ret literal(p, '{'::u32);
+    }
+    val cp: u32 = rune(p);
+    if (p.failed) { ret 0; }
+    ret literal(p, cp);
+}
+
+# a group, a named group, a non-capturing group or a flag group
+fun group(p: *Parser) usize {
+    val at: usize = p.i;
+    if (p.depth >= MAX_DEPTH) {
+        fail(p, Kind.nesting_depth{}, at);
+        ret 0;
+    }
+    p.i = p.i + 1;
+    val saved:   Flags = p.flags;
+    var capture: bool  = true;
+    var name:    View  = view(nil, 0);
+    if (peek(p) == '?') {
+        if (peek_at(p, 1) == 'P' && peek_at(p, 2) == '<') {
+            p.i  = p.i + 3;
+            name = group_name(p, at);
+        }
+        or (peek_at(p, 1) == '<') {
+            p.i  = p.i + 2;
+            name = group_name(p, at);
+        }
+        or {
+            p.i = p.i + 1;
+            val end: u8 = flag_group(p, at);
+            if (p.failed) { ret 0; }
+            # flags that close the group hold for the rest of the enclosing group
+            if (end == ')') { ret NONE; }
+            capture = false;
+        }
+        if (p.failed) { ret 0; }
+    }
+    var index: u32 = 0;
+    if (capture) {
+        index = p.ast.names.len::u32;
+        if (!put[View](p, ?p.ast.names, name)) { ret 0; }
+    }
+    p.depth = p.depth + 1;
+    val sub: usize = alternation(p);
+    p.depth = p.depth - 1;
+    if (p.failed) { ret 0; }
+    if (peek(p) != ')') {
+        fail(p, Kind.missing_paren{}, at);
+        ret 0;
+    }
+    p.i     = p.i + 1;
+    p.flags = saved;
+    if (!capture) { ret sub; }
+    ret add(p, Node.capture{Capture{index: index, name: name, sub: sub}});
+}
+
+# the name of a named group, its < already consumed
+fun group_name(p: *Parser, at: usize) View {
+    val start: usize = p.i;
+    for (more(p) && peek(p) != '>') { p.i = p.i + 1; }
+    if (!more(p)) {
+        fail(p, Kind.invalid_named_capture{}, at);
+        ret view(nil, 0);
+    }
+    val name: View = view(?p.s.data[start], p.i - start);
+    p.i = p.i + 1;
+    if (name.len == 0) {
+        fail(p, Kind.invalid_named_capture{}, at);
+        ret name;
+    }
+    var k: usize = 0;
+    for (k < name.len) {
+        if (!is_word(name.data[k])) {
+            fail(p, Kind.invalid_named_capture{}, at);
+            ret name;
+        }
+        k = k + 1;
+    }
+    var g: usize = 1;
+    for (g < p.ast.names.len) {
+        if (equal(p.ast.names.data[g], name)) {
+            fail(p, Kind.duplicate_capture_name{}, at);
+            ret name;
+        }
+        g = g + 1;
+    }
+    ret name;
+}
+
+# the flags of a (? group after the ?, giving the ) or : that ends them
+fun flag_group(p: *Parser, at: usize) u8 {
+    var f:      Flags = p.flags;
+    var negate: bool  = false;
+    var saw:    bool  = false;
+    for (more(p)) {
+        val c: u8 = peek(p);
+        p.i = p.i + 1;
+        if (c == 'i') {
+            f.fold = !negate;
+            saw    = true;
+            cnt;
+        }
+        if (c == 'm') {
+            f.multiline = !negate;
+            saw         = true;
+            cnt;
+        }
+        if (c == 's') {
+            f.dotnl = !negate;
+            saw     = true;
+            cnt;
+        }
+        if (c == 'U') {
+            f.ungreedy = !negate;
+            saw        = true;
+            cnt;
+        }
+        if (c == '-') {
+            if (negate) { brk; }
+            negate = true;
+            saw    = false;
+            cnt;
+        }
+        if (c == ':' || c == ')') {
+            # a - needs a flag after it
+            if (negate && !saw) { brk; }
+            p.flags = f;
+            ret c;
+        }
+        brk;
+    }
+    fail(p, Kind.invalid_perl_op{}, at);
+    ret 0;
+}
+
+fun escape(p: *Parser) usize {
+    val at: usize = p.i;
+    if (p.i + 1 >= p.s.len) {
+        fail(p, Kind.trailing_backslash{}, at);
+        ret 0;
+    }
+    val c: u8 = p.s.data[p.i + 1];
+    if (c == 'A' || c == 'z' || c == 'b' || c == 'B') {
+        p.i = p.i + 2;
+        if (c == 'A') { ret add(p, Node.begin_text{}); }
+        if (c == 'z') { ret add(p, Node.end_text{}); }
+        if (c == 'b') { ret add(p, Node.word_boundary{}); }
+        ret add(p, Node.not_word_boundary{});
+    }
+    if (c == 'Q' && p.i + 2 < p.s.len) { ret quoted(p); }
+    if (c == 'p' || c == 'P') {
+        val u: Unicode = unicode(p);
+        if (p.failed) { ret 0; }
+        p.items.len = 0;
+        if (!put[Item](p, ?p.items, Item.unicode{u})) { ret 0; }
+        ret finish_class(p, false);
+    }
+    val perl: Table = perl_class(c);
+    if (perl.len != 0) {
+        p.i         = p.i + 2;
+        p.items.len = 0;
+        if (!add_set(p, perl, c == 'D' || c == 'S' || c == 'W')) { ret 0; }
+        ret finish_class(p, false);
+    }
+    val cp: u32 = escape_char(p);
+    if (p.failed) { ret 0; }
+    ret literal(p, cp);
+}
+
+# \Q...\E: each code point but the last goes on the stack, and the last is the atom
+fun quoted(p: *Parser) usize {
+    p.i = p.i + 2;
+    var last: usize = NONE;
+    for (more(p)) {
+        if (peek(p) == '\\' && peek_at(p, 1) == 'E') {
+            p.i = p.i + 2;
+            brk;
+        }
+        val cp: u32 = rune(p);
+        if (p.failed) { ret 0; }
+        if (last != NONE) {
+            if (!put[usize](p, ?p.stack, last)) { ret 0; }
+        }
+        last = literal(p, cp);
+    }
+    ret last;
+}
+
+# the code point of an escape that stands for one
+fun escape_char(p: *Parser) u32 {
+    val at: usize = p.i;
+    p.i = p.i + 1;
+    if (!more(p)) {
+        fail(p, Kind.trailing_backslash{}, at);
+        ret 0;
+    }
+    val c: u8 = peek(p);
+    p.i = p.i + 1;
+    # a lone nonzero digit would be a backreference, which RE2 does not have
+    if (c >= '1' && c <= '7' && !is_octal(peek(p))) {
+        fail(p, Kind.invalid_escape{}, at);
+        ret 0;
+    }
+    if (is_octal(c)) {
+        var v: u32   = (c - '0')::u32;
+        var k: usize = 1;
+        for (k < 3 && is_octal(peek(p))) {
+            v   = v * 8 + (peek(p) - '0')::u32;
+            p.i = p.i + 1;
+            k   = k + 1;
+        }
+        ret v;
+    }
+    if (c == 'x') {
+        if (peek(p) == '{') {
+            p.i = p.i + 1;
+            var v: u32   = 0;
+            var n: usize = 0;
+            for (more(p) && hex(peek(p)) < 16) {
+                if (v <= MAX_CP) { v = v * 16 + hex(peek(p)); }
+                p.i = p.i + 1;
+                n   = n + 1;
+            }
+            if (n == 0 || peek(p) != '}' || v > MAX_CP) {
+                fail(p, Kind.invalid_escape{}, at);
+                ret 0;
+            }
+            p.i = p.i + 1;
+            ret v;
+        }
+        val h: u32 = hex(peek(p));
+        val l: u32 = hex(peek_at(p, 1));
+        if (h > 15 || l > 15) {
+            fail(p, Kind.invalid_escape{}, at);
+            ret 0;
+        }
+        p.i = p.i + 2;
+        ret h * 16 + l;
+    }
+    if (c == 'a') { ret 7; }
+    if (c == 'f') { ret 12; }
+    if (c == 't') { ret 9; }
+    if (c == 'n') { ret 10; }
+    if (c == 'r') { ret 13; }
+    if (c == 'v') { ret 11; }
+    # any ascii byte but a letter or digit escapes itself, as in RE2
+    if (c < 0x80 && !is_alnum(c)) { ret c::u32; }
+    fail(p, Kind.invalid_escape{}, at);
+    ret 0;
+}
+
+# the ranges of a perl class letter, empty for any other byte
+fun perl_class(c: u8) Table {
+    if (c == 'd' || c == 'D') { ret Table{ranges: ?DIGIT[0], len: 1}; }
+    if (c == 's' || c == 'S') { ret Table{ranges: ?SPACE[0], len: 3}; }
+    if (c == 'w' || c == 'W') { ret Table{ranges: ?WORD[0], len: 4}; }
+    ret Table{ranges: nil, len: 0};
+}
+
+# the ranges of a posix class name, empty for an unknown one
+fun posix_class(name: View) Table {
+    if (equal(name, view("alnum", 5)))  { ret Table{ranges: ?ALNUM[0], len: 3}; }
+    if (equal(name, view("alpha", 5)))  { ret Table{ranges: ?ALPHA[0], len: 2}; }
+    if (equal(name, view("ascii", 5)))  { ret Table{ranges: ?ASCII[0], len: 1}; }
+    if (equal(name, view("blank", 5)))  { ret Table{ranges: ?BLANK[0], len: 2}; }
+    if (equal(name, view("cntrl", 5)))  { ret Table{ranges: ?CNTRL[0], len: 2}; }
+    if (equal(name, view("digit", 5)))  { ret Table{ranges: ?DIGIT[0], len: 1}; }
+    if (equal(name, view("graph", 5)))  { ret Table{ranges: ?GRAPH[0], len: 1}; }
+    if (equal(name, view("lower", 5)))  { ret Table{ranges: ?LOWER[0], len: 1}; }
+    if (equal(name, view("print", 5)))  { ret Table{ranges: ?PRINT[0], len: 1}; }
+    if (equal(name, view("punct", 5)))  { ret Table{ranges: ?PUNCT[0], len: 4}; }
+    if (equal(name, view("space", 5)))  { ret Table{ranges: ?PSPACE[0], len: 2}; }
+    if (equal(name, view("upper", 5)))  { ret Table{ranges: ?UPPER[0], len: 1}; }
+    if (equal(name, view("word", 4)))   { ret Table{ranges: ?WORD[0], len: 4}; }
+    if (equal(name, view("xdigit", 6))) { ret Table{ranges: ?XDIGIT[0], len: 3}; }
+    ret Table{ranges: nil, len: 0};
+}
+
+# a set member from a table, negated or not
+fun add_set(p: *Parser, t: Table, negated: bool) bool {
+    val start: usize = p.ast.ranges.len;
+    var k:     usize = 0;
+    for (k < t.len) {
+        if (!put[Range](p, ?p.ast.ranges, t.ranges[k])) { ret false; }
+        k = k + 1;
+    }
+    val set: Set = Set{ranges: Span{start: start, len: t.len}, negated: negated};
+    ret put[Item](p, ?p.items, Item.set{set});
+}
+
+# \pN, \p{Name}, \p{^Name} and their \P complements, the escape at the next byte
+fun unicode(p: *Parser) Unicode {
+    val at:      usize = p.i;
+    var negated: bool  = p.s.data[p.i + 1] == 'P';
+    p.i = p.i + 2;
+    if (!more(p)) {
+        fail(p, Kind.invalid_char_class{}, at);
+        ret Unicode{};
+    }
+    var name: View = view(nil, 0);
+    if (peek(p) == '{') {
+        p.i = p.i + 1;
+        if (peek(p) == '^') {
+            negated = !negated;
+            p.i     = p.i + 1;
+        }
+        val start: usize = p.i;
+        for (more(p) && peek(p) != '}') { p.i = p.i + 1; }
+        if (!more(p)) {
+            fail(p, Kind.invalid_char_class{}, at);
+            ret Unicode{};
+        }
+        name = view(?p.s.data[start], p.i - start);
+        p.i  = p.i + 1;
+        if (name.len == 0) {
+            fail(p, Kind.invalid_char_range{}, at);
+            ret Unicode{};
+        }
+    }
+    or {
+        val start: usize = p.i;
+        rune(p);
+        if (p.failed) { ret Unicode{}; }
+        name = view(?p.s.data[start], p.i - start);
+    }
+    ret Unicode{name: name, negated: negated, offset: at};
+}
+
+# a character class from [
+fun class(p: *Parser) usize {
+    val at: usize = p.i;
+    p.i = p.i + 1;
+    var negated: bool = false;
+    if (peek(p) == '^') {
+        negated = true;
+        p.i     = p.i + 1;
+    }
+    p.lits.len  = 0;
+    p.items.len = 0;
+    var first: bool = true;
+    for {
+        if (!more(p)) {
+            fail(p, Kind.missing_bracket{}, at);
+            ret 0;
+        }
+        val c: u8 = peek(p);
+        # a ] first in the class is a literal
+        if (c == ']' && !first) {
+            p.i = p.i + 1;
+            brk;
+        }
+        first = false;
+        if (c == '[' && peek_at(p, 1) == ':') {
+            if (posix(p)) { cnt; }
+            if (p.failed) { ret 0; }
+        }
+        if (c == '\\') {
+            val e: u8 = peek_at(p, 1);
+            if (e == 'p' || e == 'P') {
+                val u: Unicode = unicode(p);
+                if (p.failed)                                 { ret 0; }
+                if (!put[Item](p, ?p.items, Item.unicode{u})) { ret 0; }
+                cnt;
+            }
+            val perl: Table = perl_class(e);
+            if (perl.len != 0) {
+                p.i = p.i + 2;
+                if (!add_set(p, perl, e == 'D' || e == 'S' || e == 'W')) { ret 0; }
+                cnt;
+            }
+        }
+        val start: usize = p.i;
+        val lo:    u32   = class_char(p);
+        if (p.failed) { ret 0; }
+        var hi: u32 = lo;
+        # a - between two characters makes a range, and anywhere else is literal
+        if (peek(p) == '-' && peek_at(p, 1) != ']' && p.i + 1 < p.s.len) {
+            p.i = p.i + 1;
+            if (peek(p) == '\\' && is_class_escape(peek_at(p, 1))) {
+                fail(p, Kind.invalid_char_range{}, start);
+                ret 0;
+            }
+            hi = class_char(p);
+            if (p.failed) { ret 0; }
+            if (hi < lo) {
+                fail(p, Kind.invalid_char_range{}, start);
+                ret 0;
+            }
+        }
+        if (!put[Range](p, ?p.lits, Range{lo: lo, hi: hi})) { ret 0; }
+    }
+    if (p.lits.len > 0) {
+        val start: usize = p.ast.ranges.len;
+        var k:     usize = 0;
+        for (k < p.lits.len) {
+            if (!put[Range](p, ?p.ast.ranges, p.lits.data[k])) { ret 0; }
+            k = k + 1;
+        }
+        val set: Set = Set{ranges: Span{start: start, len: p.lits.len}, negated: false};
+        if (!put[Item](p, ?p.items, Item.set{set})) { ret 0; }
+    }
+    ret finish_class(p, negated);
+}
+
+fun is_class_escape(e: u8) bool {
+    ret e == 'd' || e == 'D' || e == 's' || e == 'S' || e == 'w' || e == 'W' || e == 'p' || e == 'P';
+}
+
+# one character of a class, escaped or not
+fun class_char(p: *Parser) u32 {
+    if (peek(p) == '\\') { ret escape_char(p); }
+    ret rune(p);
+}
+
+# a [:name:] or [:^name:] at the next byte, consumed only when it is one
+fun posix(p: *Parser) bool {
+    # the name runs to the first :] after [:
+    var end: usize = p.i + 2;
+    for (end + 1 < p.s.len && !(p.s.data[end] == ':' && p.s.data[end + 1] == ']')) { end = end + 1; }
+    if (end + 1 >= p.s.len) { ret false; }
+    var start:   usize = p.i + 2;
+    var negated: bool  = false;
+    if (start < end && p.s.data[start] == '^') {
+        negated = true;
+        start   = start + 1;
+    }
+    val t: Table = posix_class(view(?p.s.data[start], end - start));
+    if (t.len == 0) {
+        fail(p, Kind.invalid_char_range{}, p.i);
+        ret false;
+    }
+    p.i = end + 2;
+    ret add_set(p, t, negated);
+}
+
+# move the parsed items into the Ast as a class node
+fun finish_class(p: *Parser, negated: bool) usize {
+    val start: usize = p.ast.items.len;
+    var k:     usize = 0;
+    for (k < p.items.len) {
+        if (!put[Item](p, ?p.ast.items, p.items.data[k])) { ret 0; }
+        k = k + 1;
+    }
+    val c: Class = Class{items: Span{start: start, len: p.items.len}, negated: negated, fold: p.flags.fold};
+    p.items.len = 0;
+    if (!put[Class](p, ?p.ast.classes, c)) { ret 0; }
+    ret add(p, Node.class{p.ast.classes.len - 1});
+}

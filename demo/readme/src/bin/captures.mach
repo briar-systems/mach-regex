@@ -1,0 +1,62 @@
+# read capture groups by number and by name
+
+use std.allocator;
+use std.allocator.page;
+use std.filesystem;
+use std.print;
+use std.runtime;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use regex;
+
+fun text(s: str) View {
+    ret view(s, str_len(s));
+}
+
+fun show(v: View) {
+    filesystem.write(filesystem.STDOUT, v.data, v.len);
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var a: allocator.Allocator;
+    page.make(?a);
+
+    var re: res[regex.Regex, regex.Error] = regex.compile(?a, text("(?P<year>\\d{4})-(?P<month>\\d{2})-(\\d{2})"));
+    if (sel re.err) { ret 1; }
+    fin { regex.dnit(?re.ok); }
+    var c: res[regex.Cache, regex.Error] = regex.cache(?a, ?re.ok);
+    if (sel c.err) { ret 1; }
+    fin { regex.cache_dnit(?c.ok); }
+
+    # two slots per group and two for the whole match: 8 for this pattern
+    var slots: [8]usize;
+    if (regex.slot_count(?re.ok) != 8) { ret 1; }
+
+    val hay: View = text("released on 2026-09-26");
+    if (!regex.captures(?re.ok, ?c.ok, hay, 0, ?slots[0])) { ret 1; }
+
+    var g: usize = 1;
+    for (g <= regex.group_count(?re.ok)) {
+        val name: View = regex.group_name(?re.ok, g);
+        print.printf("group {}", g);
+        if (name.len > 0) {
+            print.print(" ");
+            show(name);
+        }
+        print.printf(" at {}..{}: ", slots[2 * g], slots[2 * g + 1]);
+        show(view(?hay.data[slots[2 * g]], slots[2 * g + 1] - slots[2 * g]));
+        print.println("");
+        g = g + 1;
+    }
+
+    val month: opt[usize] = regex.group_index(?re.ok, text("month"));
+    if (sel month.some) { print.printlnf("month is group {}", month.some); }
+    ret 0;
+}

@@ -1,5 +1,6 @@
+# the README's examples, each a program of its own
 [project]
-id = "regex"
+id = "readme"
 version = "0.1.0"
 mach = "^6"
 src = "src"
@@ -30,21 +31,34 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
-# the library, and the only artifact `mach build .` and `--all-targets` select
-[artifact.regex]
-kind = "static"
-default = true
-entry = "lib/regex.mach"
-out = "lib/regex"
+[artifact.search]
+kind = "bin"
+entry = "bin/search.mach"
+out = "bin/search"
 targets = ["*"]
 link = []
 need = []
 
-# test-only: the library and every test module, run with `mach test . --lib tests`
-[artifact.tests]
-kind = "static"
-entry = "lib/tests.mach"
-out = "lib/tests"
+[artifact.captures]
+kind = "bin"
+entry = "bin/captures.mach"
+out = "bin/captures"
+targets = ["*"]
+link = []
+need = []
+
+[artifact.iterate]
+kind = "bin"
+entry = "bin/iterate.mach"
+out = "bin/iterate"
+targets = ["*"]
+link = []
+need = []
+
+[artifact.options]
+kind = "bin"
+entry = "bin/options.mach"
+out = "bin/options"
 targets = ["*"]
 link = []
 need = []
@@ -64,6 +78,8 @@ simd = "scalarize"
 vectorize = true
 float_reassoc = false
 
+[dep.regex]
+path = "../.."
+
 [dep.std]
-git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+path = "../../dep/std"

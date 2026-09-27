@@ -1,0 +1,143 @@
+# sets of code points as sorted, disjoint ranges
+#
+# a set lives in a Vector[Range] the caller owns. every operation leaves it
+# canonical: sorted by start, with no two ranges overlapping or touching.
+# appending may leave a set unsorted until canonical runs.
+
+use A: std.allocator;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+
+use regex.syntax.Range;
+use regex.unicode;
+
+# the largest code point
+pub val MAX_CP: u32 = 0x10FFFF;
+
+# the code points case folding reaches at all, from A to the last folding letter
+val MIN_FOLD: u32 = 0x41;
+val MAX_FOLD: u32 = 0x1E943;
+
+# append a range, giving false when the allocator refuses
+# ---
+# v:   the set
+# lo:  the first code point
+# hi:  the last code point
+# ret: whether it was appended
+pub fun append(v: *Vector[Range], lo: u32, hi: u32) bool {
+    val pushed: res[usize, A.Error] = vector.push[Range](v, Range{lo: lo, hi: hi});
+    ret sel pushed.ok;
+}
+
+fun by_start(a: *Range, b: *Range) i64 {
+    if (a.lo < b.lo) { ret -1; }
+    if (a.lo > b.lo) { ret 1; }
+    ret 0;
+}
+
+# sort the set and merge ranges that overlap or touch
+# ---
+# v: the set
+pub fun canonical(v: *Vector[Range]) {
+    if (v.len < 2) { ret; }
+    sort.sort_by[Range](v.data, v.len, by_start);
+    var w: usize = 0;
+    var r: usize = 1;
+    for (r < v.len) {
+        val next: Range = v.data[r];
+        # touching counts as overlapping, hi + 1 cannot wrap below MAX_CP
+        if (next.lo <= v.data[w].hi + 1) {
+            if (next.hi > v.data[w].hi) { v.data[w].hi = next.hi; }
+        }
+        or {
+            w         = w + 1;
+            v.data[w] = next;
+        }
+        r = r + 1;
+    }
+    v.len = w + 1;
+}
+
+# replace a canonical set with its complement over every code point
+# ---
+# v:       the set, canonical
+# scratch: storage the complement is built in, emptied first
+# ret:     false when the allocator refuses
+pub fun negate(v: *Vector[Range], scratch: *Vector[Range]) bool {
+    scratch.len = 0;
+    var next: u32   = 0;
+    var i:    usize = 0;
+    for (i < v.len) {
+        val r: Range = v.data[i];
+        if (r.lo > next) {
+            if (!append(scratch, next, r.lo - 1)) { ret false; }
+        }
+        next = r.hi + 1;
+        i    = i + 1;
+    }
+    if (next <= MAX_CP) {
+        if (!append(scratch, next, MAX_CP)) { ret false; }
+    }
+    ret copy(scratch, v);
+}
+
+# make a set's contents another's
+fun copy(from: *Vector[Range], to: *Vector[Range]) bool {
+    to.len = 0;
+    var i: usize = 0;
+    for (i < from.len) {
+        if (!append(to, from.data[i].lo, from.data[i].hi)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# add every case variant of a set's code points, as RE2 folds a class
+#
+# only code points case folding reaches are visited, each one's whole simple
+# folding orbit appended, then the set is made canonical again.
+# ---
+# v:   the set
+# ret: false when the allocator refuses
+pub fun fold(v: *Vector[Range]) bool {
+    val n: usize = v.len;
+    var i: usize = 0;
+    for (i < n) {
+        var lo: u32 = v.data[i].lo;
+        var hi: u32 = v.data[i].hi;
+        if (lo < MIN_FOLD) { lo = MIN_FOLD; }
+        if (hi > MAX_FOLD) { hi = MAX_FOLD; }
+        var c: u32 = lo;
+        for (c <= hi) {
+            var f: u32 = unicode.simple_fold(c);
+            for (f != c) {
+                if (!append(v, f, f)) { ret false; }
+                f = unicode.simple_fold(f);
+            }
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    canonical(v);
+    ret true;
+}
+
+# append a unicode table's ranges to a set
+# ---
+# v:   the set
+# t:   the table
+# ret: false when the allocator refuses
+pub fun append_table(v: *Vector[Range], t: unicode.Table) bool {
+    var i: usize = 0;
+    for (i < t.len) {
+        if (!append(v, t.ranges[i].lo, t.ranges[i].hi)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}

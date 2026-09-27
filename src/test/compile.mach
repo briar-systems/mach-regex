@@ -1,0 +1,282 @@
+# the compiler, checked by what its programs accept
+#
+# a small reference interpreter runs a program over a byte string as a whole
+# match, memoizing each instruction and position it has tried, so every test
+# asks which texts a pattern's program accepts rather than how it is built.
+
+use std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.view;
+
+use regex.compile;
+use regex.syntax;
+
+# whether a byte is an ascii word byte
+#[testing]
+fun word(b: u8) bool {
+    ret (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_';
+}
+
+#[testing]
+fun holds(a: compile.Assert, s: *u8, n: usize, pos: usize) bool {
+    if (sel a.begin_text) { ret pos == 0; }
+    if (sel a.end_text)   { ret pos == n; }
+    if (sel a.begin_line) { ret pos == 0 || s[pos - 1] == '\n'; }
+    if (sel a.end_line)   { ret pos == n || s[pos] == '\n'; }
+    val before: bool = pos > 0 && word(s[pos - 1]);
+    val after:  bool = pos < n && word(s[pos]);
+    if (sel a.word_boundary) { ret before != after; }
+    ret before == after;
+}
+
+#[testing]
+fun run(p: *compile.Prog, pc: u32, s: *u8, n: usize, pos: usize, seen: *u8) bool {
+    val key: usize = pc::usize * (n + 1) + pos;
+    if (seen[key] != 0) { ret false; }
+    seen[key] = 1;
+    val i: compile.Inst = p.insts.data[pc];
+    if (sel i.match) { ret pos == n; }
+    if (sel i.range) { ret pos < n && s[pos] >= i.range.lo && s[pos] <= i.range.hi && run(p, i.range.next, s, n, pos + 1, seen); }
+    if (sel i.sparse) {
+        if (pos >= n) { ret false; }
+        var k: u32 = 0;
+        for (k < i.sparse.len) {
+            val t: compile.Trans = p.trans.data[i.sparse.start + k];
+            if (s[pos] >= t.lo && s[pos] <= t.hi) { ret run(p, t.next, s, n, pos + 1, seen); }
+            k = k + 1;
+        }
+        ret false;
+    }
+    if (sel i.split) { ret run(p, i.split.x, s, n, pos, seen) || run(p, i.split.y, s, n, pos, seen); }
+    if (sel i.save)  { ret run(p, i.save.next, s, n, pos, seen); }
+    if (sel i.look)  { ret holds(i.look.assert, s, n, pos) && run(p, i.look.next, s, n, pos, seen); }
+    ret false;
+}
+
+# a pattern compiled with the testing allocator, cleaned up by close
+rec Compiled {
+    t:    testing.Testing;
+    tree: syntax.Ast;
+    prog: compile.Prog;
+    ok:   bool;
+}
+
+#[testing]
+fun open(c: *Compiled, pattern: str) {
+    testing.make(?c.t);
+    val a:     *allocator.Allocator          = testing.allocator_of(?c.t);
+    var flags: syntax.Flags;
+    val tree:  res[syntax.Ast, syntax.Error] = syntax.parse(a, view(pattern, str_len(pattern)), flags, false);
+    c.ok = false;
+    if (sel tree.err) { ret; }
+    c.tree = tree.ok;
+    val p: res[compile.Prog, syntax.Error] = compile.compile(a, ?c.tree);
+    if (sel p.err) {
+        syntax.dnit(?c.tree);
+        ret;
+    }
+    c.prog = p.ok;
+    c.ok   = true;
+}
+
+#[testing]
+fun close(c: *Compiled) bool {
+    if (c.ok) {
+        compile.dnit(?c.prog);
+        syntax.dnit(?c.tree);
+    }
+    val clean: bool = !testing.leaked(?c.t);
+    testing.dnit(?c.t);
+    ret clean;
+}
+
+# whether the program accepts exactly the text given as n bytes
+#[testing]
+fun accepts(c: *Compiled, s: *u8, n: usize) bool {
+    var seen: [8192]u8;
+    var k:    usize = 0;
+    for (k < 8192) {
+        seen[k] = 0;
+        k       = k + 1;
+    }
+    if (compile.size(?c.prog) * (n + 1) > 8192) { ret false; }
+    ret run(?c.prog, c.prog.start, s, n, 0, ?seen[0]);
+}
+
+#[testing]
+fun takes(c: *Compiled, s: str) bool {
+    ret accepts(c, s, str_len(s));
+}
+
+# whether the program accepts a code point's encoding
+#[testing]
+fun takes_cp(c: *Compiled, cp: u32) bool {
+    var b: [4]u8;
+    val n: u32 = compile.encode(cp, ?b[0]);
+    ret accepts(c, ?b[0], n::usize);
+}
+
+test utf8__sequences_of_every_code_point {
+    var t: testing.Testing;
+    testing.make(?t);
+    var seqs: Vector[compile.Seq] = vector.init[compile.Seq](testing.allocator_of(?t));
+    if (!compile.sequences(0, 0x10FFFF, ?seqs)) { ret 1; }
+    # the canonical split, lo and hi bytes by position
+    val want: [9]str = [9]str{"00-7f", "c2-df 80-bf", "e0-e0 a0-bf 80-bf", "e1-ec 80-bf 80-bf", "ed-ed 80-9f 80-bf", "ee-ef 80-bf 80-bf", "f0-f0 90-bf 80-bf 80-bf", "f1-f3 80-bf 80-bf 80-bf", "f4-f4 80-8f 80-bf 80-bf"};
+    if (seqs.len != 9) { ret 2; }
+    val digits: str   = "0123456789abcdef";
+    var k:      usize = 0;
+    for (k < 9) {
+        var text: [32]u8;
+        var w:    usize       = 0;
+        var d:    u32         = 0;
+        val s:    compile.Seq = seqs.data[k];
+        for (d < s.len) {
+            if (d > 0) {
+                text[w] = ' ';
+                w       = w + 1;
+            }
+            text[w]     = digits[s.lo[d] >> 4];
+            text[w + 1] = digits[s.lo[d] & 0xF];
+            text[w + 2] = '-';
+            text[w + 3] = digits[s.hi[d] >> 4];
+            text[w + 4] = digits[s.hi[d] & 0xF];
+            w           = w + 5;
+            d           = d + 1;
+        }
+        text[w] = 0;
+        if (!str_equals(?text[0], want[k])) { ret 3; }
+        k = k + 1;
+    }
+    vector.dnit[compile.Seq](?seqs);
+    testing.dnit(?t);
+    ret 0;
+}
+
+test compile__classes_accept_exactly_their_members {
+    var c: Compiled;
+    open(?c, "\\p{Greek}");
+    if (!c.ok || !takes_cp(?c, 0x3B1) || !takes_cp(?c, 0x3A9) || takes_cp(?c, 'a')) { ret 1; }
+    if (!close(?c))                                                                 { ret 2; }
+    open(?c, "[^a-z]");
+    if (!c.ok || !takes(?c, "A") || takes(?c, "q") || !takes_cp(?c, 0x1F600) || takes(?c, "\xFF")) { ret 3; }
+    if (!close(?c))                                                                                { ret 4; }
+    open(?c, "(?i)k");
+    if (!c.ok || !takes(?c, "k") || !takes(?c, "K") || !takes_cp(?c, 0x212A) || takes(?c, "x")) { ret 5; }
+    if (!close(?c))                                                                             { ret 6; }
+    # a negated member folds before it negates, so no variant of k is outside \w
+    open(?c, "(?i)\\W");
+    if (!c.ok || takes(?c, "k") || takes(?c, "K") || takes_cp(?c, 0x212A) || !takes(?c, "-")) { ret 7; }
+    if (!close(?c))                                                                           { ret 8; }
+    open(?c, ".");
+    if (!c.ok || takes(?c, "\n") || !takes_cp(?c, 0x10FFFF) || takes(?c, "\xED\xA0\x80")) { ret 9; }
+    if (!close(?c))                                                                       { ret 10; }
+    open(?c, "(?s).");
+    if (!c.ok || !takes(?c, "\n")) { ret 11; }
+    if (!close(?c))                { ret 12; }
+    open(?c, "[^\\x00-\\x{10FFFF}]");
+    if (!c.ok || takes(?c, "a") || takes(?c, "")) { ret 13; }
+    if (!close(?c))                               { ret 14; }
+    ret 0;
+}
+
+test compile__repetition_captures_and_anchors {
+    var c: Compiled;
+    open(?c, "a{2,3}");
+    if (!c.ok || takes(?c, "a") || !takes(?c, "aa") || !takes(?c, "aaa") || takes(?c, "aaaa")) { ret 1; }
+    if (!close(?c))                                                                            { ret 2; }
+    open(?c, "(a|bc)+d?");
+    if (!c.ok || !takes(?c, "abca") || !takes(?c, "bcd") || takes(?c, "d") || takes(?c, "ab")) { ret 3; }
+    if (!close(?c))                                                                            { ret 4; }
+    open(?c, "(a*)*b");
+    if (!c.ok || !takes(?c, "b") || !takes(?c, "aaab") || takes(?c, "aaa")) { ret 5; }
+    if (!close(?c))                                                         { ret 6; }
+    open(?c, "x{2,}");
+    if (!c.ok || takes(?c, "x") || !takes(?c, "xx") || !takes(?c, "xxxxx")) { ret 7; }
+    if (!close(?c))                                                         { ret 8; }
+    open(?c, "(?m)^a$\\n^\\bb\\B");
+    if (!c.ok || c.prog.slots != 2) { ret 9; }
+    if (!close(?c))                 { ret 10; }
+    open(?c, "(a)(?P<n>b)");
+    if (!c.ok || c.prog.slots != 6 || !takes(?c, "ab")) { ret 11; }
+    if (!close(?c))                                     { ret 12; }
+    ret 0;
+}
+
+# every code point takes 11 instructions, \p{Greek} 26 and \pL 313, as built today
+test compile__sizes_stay_small {
+    var c: Compiled;
+    open(?c, "[\\x00-\\x{10FFFF}]");
+    if (!c.ok || compile.size(?c.prog) > 16) { ret 1; }
+    if (!close(?c))                          { ret 2; }
+    open(?c, "\\p{Greek}");
+    if (!c.ok || compile.size(?c.prog) > 40) { ret 3; }
+    if (!close(?c))                          { ret 4; }
+    open(?c, "\\pL");
+    if (!c.ok || compile.size(?c.prog) > 400) { ret 5; }
+    if (!close(?c))                           { ret 6; }
+    ret 0;
+}
+
+test compile__errors {
+    var t: testing.Testing;
+    testing.make(?t);
+    val a:     *allocator.Allocator          = testing.allocator_of(?t);
+    var flags: syntax.Flags;
+    var tree:  res[syntax.Ast, syntax.Error] = syntax.parse(a, view("a\\p{Nope}", 9), flags, false);
+    if (sel tree.err) { ret 1; }
+    val bad: res[compile.Prog, syntax.Error] = compile.compile(a, ?tree.ok);
+    if (sel bad.ok)                                                                                     { ret 2; }
+    if (!str_equals(syntax.text(bad.err.kind), "invalid character class range") || bad.err.offset != 1) { ret 3; }
+    syntax.dnit(?tree.ok);
+    var big: res[syntax.Ast, syntax.Error] = syntax.parse(a, view("(\\pL{1000}){1000}", 17), flags, false);
+    if (sel big.err) { ret 4; }
+    val large: res[compile.Prog, syntax.Error] = compile.compile(a, ?big.ok);
+    if (sel large.ok)                                                     { ret 5; }
+    if (!str_equals(syntax.text(large.err.kind), "expression too large")) { ret 6; }
+    syntax.dnit(?big.ok);
+    if (testing.leaked(?t)) { ret 7; }
+    testing.dnit(?t);
+    ret 0;
+}
+
+# every allocation the compiler makes can fail, and each failure frees what it took
+test compile__allocation_failures {
+    # the parse draws on its own allocator, so each ordinal counts only the compiler's allocations
+    var parsed: testing.Testing;
+    testing.make(?parsed);
+    var flags: syntax.Flags;
+    var tree:  res[syntax.Ast, syntax.Error] = syntax.parse(testing.allocator_of(?parsed), view("(?i)(a|[b-d\\p{Greek}])*x{2}", 26), flags, false);
+    if (sel tree.err) { ret 1; }
+    var n: usize = 1;
+    for (n < 400) {
+        var t: testing.Testing;
+        testing.make(?t);
+        testing.fail_at_ordinal(?t, n);
+        val got: res[compile.Prog, syntax.Error] = compile.compile(testing.allocator_of(?t), ?tree.ok);
+        if (sel got.ok) {
+            var p: compile.Prog = got.ok;
+            compile.dnit(?p);
+            val leaked: bool = testing.leaked(?t);
+            testing.dnit(?t);
+            syntax.dnit(?tree.ok);
+            testing.dnit(?parsed);
+            if (leaked) { ret 2; }
+            ret 0;
+        }
+        if (testing.leaked(?t)) { ret 3; }
+        testing.dnit(?t);
+        n = n + 1;
+    }
+    ret 4;
+}
