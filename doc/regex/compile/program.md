@@ -161,3 +161,17 @@ the number of instructions
 p: the program
 ret: how many instructions it holds
 
+## fun step
+
+```mach
+pub fun step(p: *Prog, i: Inst, b: u8, next: *u32) bool;
+```
+
+where a byte leads from an instruction that reads one
+
+p: the program
+i: one of its instructions
+b: the byte
+next: where the instruction after goes, when the byte is taken
+ret: whether the instruction reads the byte, false for any that reads none
+
