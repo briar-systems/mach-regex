@@ -165,7 +165,12 @@ fun is_word(b: u8) bool {
 }
 
 # whether an assertion holds at a position of the text
-fun holds(a: Assert, text: View, at: usize) bool {
+# ---
+# a:    the assertion
+# text: the text
+# at:   the position
+# ret:  whether it holds there
+pub fun holds(a: Assert, text: View, at: usize) bool {
     if (sel a.begin_text) { ret at == 0; }
     if (sel a.end_text)   { ret at == text.len; }
     if (sel a.begin_line) { ret at == 0 || text.data[at - 1] == '\n'; }
@@ -177,7 +182,11 @@ fun holds(a: Assert, text: View, at: usize) bool {
 }
 
 # whether a position does not split a utf-8 sequence
-fun boundary(text: View, at: usize) bool {
+# ---
+# text: the text
+# at:   the position
+# ret:  whether a code point may begin there
+pub fun boundary(text: View, at: usize) bool {
     ret at == 0 || at >= text.len || (text.data[at] & 0xC0) != 0x80;
 }
 
