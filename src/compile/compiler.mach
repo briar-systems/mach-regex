@@ -146,7 +146,10 @@ pub fun compile(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
     val body: u32 = node(?c, tree.root, end);
     p.start = emit(?c, Inst.save{Save{slot: 0, next: body}});
     p.slots = (tree.names.len * 2)::u32;
-    if (!c.failed) { prefix(?p); }
+    if (!c.failed) {
+        prefix(?p);
+        classify(?p);
+    }
     if (c.failed) {
         prog.dnit(?p);
         ret res[Prog, syntax.Error].err{c.err};
@@ -174,6 +177,55 @@ fun prefix(p: *Prog) {
         }
         brk;
     }
+}
+
+# a class starts at lo and another just past hi
+fun cut(starts: *u8, lo: u8, hi: u8) {
+    starts[lo::usize]     = 1;
+    starts[hi::usize + 1] = 1;
+}
+
+# partition the bytes into the classes the program tells apart
+#
+# every transition's range bounds a class, and so do the newline, the utf-8
+# continuation bytes and, when the program asserts a word boundary, the ascii
+# word bytes, since a search decides line anchors, where new matches may start
+# and word boundaries by the byte's class alone.
+fun classify(p: *Prog) {
+    var starts: [257]u8;
+    var word:   bool  = false;
+    var k:      usize = 0;
+    for (k < p.insts.len) {
+        val i: Inst = p.insts.data[k];
+        if (sel i.range) {
+            cut(?starts[0], i.range.lo, i.range.hi);
+        }
+        or (sel i.look) {
+            if (sel i.look.assert.word_boundary || sel i.look.assert.not_word_boundary) { word = true; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < p.trans.len) {
+        cut(?starts[0], p.trans.data[k].lo, p.trans.data[k].hi);
+        k = k + 1;
+    }
+    cut(?starts[0], '\n', '\n');
+    cut(?starts[0], 0x80, 0xBF);
+    if (word) {
+        cut(?starts[0], '0', '9');
+        cut(?starts[0], 'A', 'Z');
+        cut(?starts[0], '_', '_');
+        cut(?starts[0], 'a', 'z');
+    }
+    var n: u32 = 0;
+    k = 0;
+    for (k < 256) {
+        if (k > 0 && starts[k] != 0) { n = n + 1; }
+        p.classes[k] = n::u8;
+        k            = k + 1;
+    }
+    p.class_count = n + 1;
 }
 
 fun fail(c: *Compiler, kind: Kind, offset: usize) {
@@ -764,4 +816,19 @@ test compile__allocation_failures {
         n = n + 1;
     }
     ret 4;
+}
+
+test compile__byte_classes {
+    var c: Compiled;
+    open(?c, "a");
+    # 0-9, the newline, 11-96, a, b-127, the continuation bytes and 192-255
+    if (!c.ok || c.prog.class_count != 7)                                                             { ret 1; }
+    if (c.prog.classes['a'] == c.prog.classes['b'] || c.prog.classes['b'] != c.prog.classes['z'])     { ret 2; }
+    if (c.prog.classes[0x80] != c.prog.classes[0xBF] || c.prog.classes[0xBF] == c.prog.classes[0xC0]) { ret 3; }
+    if (!close(?c))                                                                                   { ret 4; }
+    open(?c, "\\bx");
+    # a word boundary also sets the ascii word bytes apart
+    if (!c.ok || c.prog.classes['_'] == c.prog.classes['^'] || c.prog.classes['0'] == c.prog.classes['/']) { ret 5; }
+    if (!close(?c))                                                                                        { ret 6; }
+    ret 0;
 }
