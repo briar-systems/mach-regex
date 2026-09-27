@@ -4,3 +4,5 @@
 # arrives, so consumers write `use regex;` and reach everything through it.
 
 use std.runtime;
+
+fwd regex.unicode;

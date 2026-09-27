@@ -1,0 +1,88 @@
+# lookups over the generated unicode tables: class names and case folding
+
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.view.View;
+
+use regex.unicode.classes;
+use regex.unicode.folds;
+
+# an inclusive range of code points
+# ---
+# lo: first code point
+# hi: last code point, at least lo
+pub rec Range {
+    lo: u32;
+    hi: u32;
+}
+
+# a borrowed view of a static range table, sorted and non-overlapping
+# ---
+# ranges: the first range
+# len:    number of ranges
+pub rec Table {
+    ranges: *Range;
+    len:    usize;
+}
+
+# order a view against a null-terminated name by byte
+# ---
+# name: the view
+# key:  the null-terminated name
+# ret:  negative, zero or positive as name sorts before, equal to or after key
+fun compare(name: View, key: *u8) i64 {
+    var i: usize = 0;
+    for (i < name.len) {
+        if (key[i] == 0)            { ret 1; }
+        if (name.data[i] != key[i]) { ret name.data[i]::i64 - key[i]::i64; }
+        i = i + 1;
+    }
+    if (key[i] == 0) { ret 0; }
+    ret -1;
+}
+
+# the table of a class name as RE2 accepts it: a general category, a script or Any
+# ---
+# name: the class name, case-sensitive
+# ret:  the class's table, or none for an unknown name
+pub fun class(name: View) opt[Table] {
+    var lo: u32 = 0;
+    var hi: u32 = classes.COUNT;
+    for (lo < hi) {
+        val mid:   u32 = lo + (hi - lo) / 2;
+        val order: i64 = compare(name, classes.NAMES[mid]);
+        if (order == 0) {
+            val first: *u32 = ?classes.RANGES[classes.STARTS[mid] * 2];
+            ret opt[Table].some{Table{ranges: first::*Range, len: classes.COUNTS[mid]::usize}};
+        }
+        or (order < 0) {
+            hi = mid;
+        }
+        or {
+            lo = mid + 1;
+        }
+    }
+    ret opt[Table].none{};
+}
+
+# the next code point in cp's simple case folding orbit, as go's unicode.SimpleFold
+# ---
+# cp:  a code point
+# ret: the smallest code point in the orbit greater than cp, else the smallest in the
+#      orbit, or cp itself when it has no fold
+pub fun simple_fold(cp: u32) u32 {
+    var lo: u32 = 0;
+    var hi: u32 = folds.COUNT;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        val key: u32 = folds.FOLDS[mid * 2];
+        if (key == cp) { ret folds.FOLDS[mid * 2 + 1]; }
+        or (cp < key) {
+            hi = mid;
+        }
+        or {
+            lo = mid + 1;
+        }
+    }
+    ret cp;
+}
