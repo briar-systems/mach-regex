@@ -191,7 +191,10 @@ fun generate(a: *A.Allocator, tree: *syntax.Ast, backward: bool) res[Prog, synta
         val body: u32 = node(?c, tree.root, end);
         p.start = emit(?c, Inst.save{Save{slot: 0, next: body}});
         p.slots = (tree.names.len * 2)::u32;
-        if (!c.failed) { prefix(?p); }
+        if (!c.failed) {
+            prefix(?p);
+            firsts(?c, a);
+        }
     }
     if (!c.failed) { classify(?p); }
     if (c.failed) {
@@ -270,6 +273,104 @@ fun classify(p: *Prog) {
         k            = k + 1;
     }
     p.class_count = n + 1;
+}
+
+# the bytes every match begins with one of, when there are at most three
+#
+# they are the ranges reached from the start through saves and choices alone.
+# an assertion or a match before any byte, or a fourth byte, leaves none, since
+# then a search cannot skip to the next of them.
+fun firsts(c: *Compiler, a: *A.Allocator) {
+    val p:       *Prog       = c.prog;
+    var visited: Vector[u8]  = vector.init[u8](a);
+    var stack:   Vector[u32] = vector.init[u32](a);
+    fin {
+        vector.dnit[u8](?visited);
+        vector.dnit[u32](?stack);
+    }
+    p.first_count = 0;
+    val grown: res[usize, A.Error] = vector.ensure[u8](?visited, p.insts.len);
+    val room:  res[usize, A.Error] = vector.push[u32](?stack, p.start);
+    if (sel grown.err || sel room.err) {
+        fail(c, Kind.memory{}, 0);
+        ret;
+    }
+    var k: usize = 0;
+    for (k < p.insts.len) {
+        visited.data[k] = 0;
+        k               = k + 1;
+    }
+    visited.len = p.insts.len;
+    var bytes: [256]u8;
+    var count: u32 = 0;
+    for (stack.len > 0) {
+        stack.len = stack.len - 1;
+        val pc: u32 = stack.data[stack.len];
+        if (visited.data[pc] != 0) { cnt; }
+        visited.data[pc] = 1;
+        val i:    Inst  = p.insts.data[pc];
+        var next: [2]u32;
+        var more: usize = 0;
+        if (sel i.split) {
+            next[0] = i.split.x;
+            next[1] = i.split.y;
+            more    = 2;
+        }
+        or (sel i.save) {
+            next[0] = i.save.next;
+            more    = 1;
+        }
+        or (sel i.range) {
+            count = add_firsts(?bytes[0], count, i.range.lo, i.range.hi);
+        }
+        or (sel i.sparse) {
+            var t: u32 = 0;
+            for (t < i.sparse.len) {
+                val tr: Trans = p.trans.data[i.sparse.start + t];
+                count = add_firsts(?bytes[0], count, tr.lo, tr.hi);
+                t     = t + 1;
+            }
+        }
+        or (sel i.look || sel i.match) {
+            ret;
+        }
+        if (count > 3) { ret; }
+        var m: usize = 0;
+        for (m < more) {
+            val pushed: res[usize, A.Error] = vector.push[u32](?stack, next[m]);
+            if (sel pushed.err) {
+                fail(c, Kind.memory{}, 0);
+                ret;
+            }
+            m = m + 1;
+        }
+    }
+    if (count == 0) { ret; }
+    var n: u32   = 0;
+    var b: usize = 0;
+    for (b < 256) {
+        if (bytes[b] != 0) {
+            p.firsts[n] = b::u8;
+            n           = n + 1;
+        }
+        b = b + 1;
+    }
+    p.first_count = count;
+}
+
+# mark the bytes of a range among the first bytes, giving the new count, which
+# stops mattering once it passes three
+fun add_firsts(bytes: *u8, count: u32, lo: u8, hi: u8) u32 {
+    var n: u32   = count;
+    var b: usize = lo::usize;
+    for (b <= hi::usize && n <= 3) {
+        if (bytes[b] == 0) {
+            bytes[b] = 1;
+            n        = n + 1;
+        }
+        b = b + 1;
+    }
+    ret n;
 }
 
 fun fail(c: *Compiler, kind: Kind, offset: usize) {
@@ -1062,5 +1163,27 @@ test reverse__accepts_the_text_backward {
     if (!c.ok || !takes_backward(?c, "\xce\xb1b\xc3\xa9\xe2\x84\xaa") || !takes_backward(?c, "\xcf\x89a\xc3\xa9K")) { ret 5; }
     if (takes_backward(?c, "\xce\xb1d\xc3\xa9k") || takes(?c, "\xce\xb1b\xc3\xa9k"))                                { ret 6; }
     if (!close(?c))                                                                                                 { ret 7; }
+    ret 0;
+}
+
+test compile__first_bytes {
+    var c: Compiled;
+    # s folds to S and to the long s, whose utf-8 begins with 0xc5
+    open(?c, "(?i)sherlock");
+    if (!c.ok || c.prog.first_count != 3 || c.prog.firsts[0] != 'S' || c.prog.firsts[1] != 's' || c.prog.firsts[2] != 0xC5) { ret 1; }
+    if (!close(?c))                                                                                                         { ret 2; }
+    open(?c, "a|bc|c");
+    if (!c.ok || c.prog.first_count != 3) { ret 3; }
+    if (!close(?c))                       { ret 4; }
+    # four bytes, an assertion first, or a match without a byte leave none
+    open(?c, "a|b|c|d");
+    if (!c.ok || c.prog.first_count != 0) { ret 5; }
+    if (!close(?c))                       { ret 6; }
+    open(?c, "\\ba");
+    if (!c.ok || c.prog.first_count != 0) { ret 7; }
+    if (!close(?c))                       { ret 8; }
+    open(?c, "x*");
+    if (!c.ok || c.prog.first_count != 0) { ret 9; }
+    if (!close(?c))                       { ret 10; }
     ret 0;
 }
