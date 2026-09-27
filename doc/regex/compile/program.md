@@ -112,6 +112,23 @@ pub val MAX_PREFIX: u32 = 16
 
 the most bytes of a required prefix a program keeps
 
+## val MAX_FIRSTS
+
+```mach
+pub val MAX_FIRSTS: u32 = 16
+```
+
+the most first bytes a program keeps
+
+## val RANK
+
+```mach
+pub val RANK: [256]u8 = [256]u8;
+```
+
+how common each byte is in typical text, higher for more common, from the
+memchr crate's default ranking, which is in the public domain
+
 ## rec Prog
 
 ```mach
@@ -127,7 +144,7 @@ slots: the number of capture slots, two per group and two for the whole match
 prefix: bytes every match begins with, the first prefix_len of them
 prefix_len: how many bytes of prefix are required, 0 for none
 firsts: the bytes every match begins with one of, the first first_count of them
-first_count: how many, 1 to 3, or 0 when there are more or a match can begin without a byte
+first_count: how many, 1 to 16, or 0 when there are more or a match can begin without a byte
 classes: each byte's class. the program never tells two bytes of a class apart
 class_count: how many classes there are
 
