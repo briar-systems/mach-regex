@@ -35,6 +35,7 @@ mach fmt --check demo/search
 | `src/data/` | the conformance data, embedded by `src/api.mach` |
 | `demo/` | one example program per project, built by CI |
 | `doc/` | the generated API reference and the hand-written guides in `doc/guide/` |
+| `src/bin/rebar.mach` | the rebar runner, for benchmarks |
 | `tools/` | generators for committed sources |
 
 A module file must not share its name with a type its module declares, in any
@@ -78,6 +79,44 @@ what the tool generates.
 in `.gitattributes` so that no checkout rewrites its line endings. A change
 that makes any check fail is a change to RE2's semantics, and needs a reason
 that RE2 itself would accept.
+
+## Benchmarks
+
+The `rebar` artifact, `src/bin/rebar.mach`, is a runner for
+[rebar](https://github.com/BurntSushi/rebar), the regex barometer, so mach-regex
+can be measured against RE2, Rust's regex, Go's regexp and the rest. It
+implements the compile, count, count-spans, count-captures, grep and
+grep-captures models.
+
+```sh
+mach build . --profile release --bin rebar
+```
+
+In a rebar checkout, add the engine to `benchmarks/engines.toml`, with `cwd` the
+path to this checkout:
+
+```toml
+[[engine]]
+  name = "mach/regex"
+  cwd = "/path/to/mach-regex"
+  [engine.version]
+    bin = "./out/linux-x86_64/release/bin/rebar"
+    args = ["version"]
+  [engine.run]
+    bin = "./out/linux-x86_64/release/bin/rebar"
+  [[engine.build]]
+    bin = "mach"
+    args = ["build", ".", "--profile", "release", "--bin", "rebar"]
+```
+
+and add `mach/regex` to the `engines` of each benchmark it should run. It has
+Go's syntax, semantics and ASCII perl classes, so it runs wherever `go/regexp`
+does, with the same counts. Then compare it:
+
+```sh
+rebar measure -e '^(mach/regex|go/regexp|re2|rust/regex)$' -f '^curated/' > results.csv
+rebar cmp results.csv
+```
 
 ## Workflow
 
