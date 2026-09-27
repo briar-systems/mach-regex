@@ -1,0 +1,29 @@
+# the syntax of RE2 regular expressions: parsing a pattern into an Ast
+#
+# the Ast is the contract between the parser and the compiler. it keeps unicode
+# class names symbolic, so resolving them against the unicode tables is the
+# compiler's work.
+
+use regex.syntax.ast;
+use regex.syntax.error;
+use parser: regex.syntax.parse;
+
+fwd ast.Ast;
+fwd ast.Capture;
+fwd ast.Class;
+fwd ast.Flags;
+fwd ast.Item;
+fwd ast.Literal;
+fwd ast.Node;
+fwd ast.Range;
+fwd ast.Repeat;
+fwd ast.Set;
+fwd ast.Span;
+fwd ast.Unicode;
+fwd ast.UNBOUNDED;
+fwd ast.dnit;
+fwd ast.groups;
+fwd error.Error;
+fwd error.Kind;
+fwd error.text;
+fwd parser.parse;

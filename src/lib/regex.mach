@@ -6,3 +6,4 @@
 use std.runtime;
 
 fwd regex.unicode;
+fwd regex.syntax;
