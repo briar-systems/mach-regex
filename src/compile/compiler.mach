@@ -141,11 +141,34 @@ pub fun compile(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
     val body: u32 = node(?c, tree.root, end);
     p.start = emit(?c, Inst.save{Save{slot: 0, next: body}});
     p.slots = (tree.names.len * 2)::u32;
+    if (!c.failed) { prefix(?p); }
     if (c.failed) {
         prog.dnit(?p);
         ret res[Prog, syntax.Error].err{c.err};
     }
     ret res[Prog, syntax.Error].ok{p};
+}
+
+# the literal bytes every match begins with: the single-byte ranges reached
+# from the start through capture saves alone, before any choice or assertion
+fun prefix(p: *Prog) {
+    var pc: u32 = p.start;
+    p.prefix_len = 0;
+    for (p.prefix_len < prog.MAX_PREFIX) {
+        val i: Inst = p.insts.data[pc];
+        if (sel i.save) {
+            pc = i.save.next;
+            cnt;
+        }
+        if (sel i.range) {
+            if (i.range.lo != i.range.hi) { brk; }
+            p.prefix[p.prefix_len] = i.range.lo;
+            p.prefix_len           = p.prefix_len + 1;
+            pc                     = i.range.next;
+            cnt;
+        }
+        brk;
+    }
 }
 
 fun fail(c: *Compiler, kind: Kind, offset: usize) {
