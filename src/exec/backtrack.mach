@@ -202,8 +202,8 @@ fun push(c: *Cache, depth: *usize, a: u32, b: u32) {
 # leftmost-longest follows every path and keeps the first to reach the
 # furthest match in best. positions in the bitset and in frames are relative
 # to base, and a state's bit is at its instruction times width plus its
-# position.
-fun run(p: *Prog, c: *Cache, text: View, base: usize, width: usize, from: usize, longest: bool, active: usize, matched: *bool) bool {
+# position. no byte at or past limit is read.
+fun run(p: *Prog, c: *Cache, text: View, limit: usize, base: usize, width: usize, from: usize, longest: bool, active: usize, matched: *bool) bool {
     var depth: usize = 0;
     push(c, ?depth, p.start, (from - base)::u32);
     for (depth > 0) {
@@ -257,7 +257,7 @@ fun run(p: *Prog, c: *Cache, text: View, base: usize, width: usize, from: usize,
                 }
                 brk;
             }
-            if (at >= text.len) { brk; }
+            if (at >= limit) { brk; }
             val b: u8 = text.data[at];
             if (sel i.range) {
                 if (b < i.range.lo || b > i.range.hi) { brk; }
@@ -293,7 +293,27 @@ fun run(p: *Prog, c: *Cache, text: View, base: usize, width: usize, from: usize,
 # out:      where the slots of the match go, active of them
 # ret:      whether there is a match
 pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, longest: bool, active: usize, out: *usize) bool {
-    val width: usize = text.len - start + 1;
+    ret search_within(p, c, text, start, text.len, anchored, longest, active, out);
+}
+
+# search a text for the program's match, reading no byte at or past limit
+#
+# assertions still see the whole text, so a match known to end by limit is
+# found with the same groups, as when the lazy dfas have found its bounds. the
+# search must fit: fits(c, limit - start).
+# ---
+# p:        the program
+# c:        scratch sized for the program
+# text:     the text
+# start:    where the search begins, a code point boundary
+# limit:    where reading stops, at most the text's length
+# anchored: a match must begin at start
+# longest:  leftmost-longest rather than leftmost-first
+# active:   how many slots to record, at least 2 and at most the program's
+# out:      where the slots of the match go, active of them
+# ret:      whether there is a match
+pub fun search_within(p: *Prog, c: *Cache, text: View, start: usize, limit: usize, anchored: bool, longest: bool, active: usize, out: *usize) bool {
+    val width: usize = limit - start + 1;
     val words: usize = (c.size * width + 63) / 64;
     var k:     usize = 0;
     for (k < words) {
@@ -303,7 +323,7 @@ pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, lo
     var matched: bool  = false;
     var found:   bool  = false;
     var at:      usize = start;
-    for (at <= text.len && !found && !matched) {
+    for (at <= limit && !found && !matched) {
         # a match must begin with the prefix, so no other start can find one
         if (boundary(text, at) && (p.prefix_len == 0 || prefixed(p, text, at))) {
             k = 0;
@@ -311,7 +331,7 @@ pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, lo
                 c.slots.data[k] = NONE;
                 k               = k + 1;
             }
-            found = run(p, c, text, start, width, at, longest, active, ?matched);
+            found = run(p, c, text, limit, start, width, at, longest, active, ?matched);
         }
         if (anchored) { brk; }
         at = at + 1;
