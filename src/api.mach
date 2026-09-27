@@ -279,7 +279,7 @@ pub fun find(re: *Regex, c: *Cache, text: View, from: usize) opt[Match] {
 pub fun captures(re: *Regex, c: *Cache, text: View, from: usize, slots: *usize) bool {
     if (from > text.len) { ret false; }
     val start: usize = aligned(text, from);
-    # a short enough rest of the text goes to the backtracker, which resolves captures faster
+    # the backtracker takes a rest of the text short enough for its bitset
     if (backtrack.fits(?re.prog, text.len - start)) { ret backtrack.search(?re.prog, ?c.bt, text, start, false, re.longest, slot_count(re), slots); }
     ret pikevm.search(?re.prog, ?c.vm, text, start, false, re.longest, slot_count(re), slots);
 }
