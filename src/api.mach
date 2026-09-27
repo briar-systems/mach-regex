@@ -1,0 +1,332 @@
+# compile a pattern once and search texts with it
+#
+# a Regex owns its compiled program and its group names. searching needs
+# scratch sized for the program, held in a Cache the caller makes once and
+# reuses, so a search makes no allocation. a cache belongs to the Regex it
+# was made for. positions are byte offsets into the text, which is utf-8.
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+use std.types.view.view;
+
+use program: regex.compile;
+use regex.compile.Prog;
+use regex.exec.pikevm;
+use regex.syntax;
+use regex.syntax.Error;
+use regex.syntax.Kind;
+
+# a capture slot for a group that took no part in the match
+pub val NONE: usize = 0xFFFFFFFFFFFFFFFF;
+
+# how a pattern is compiled
+# ---
+# case_insensitive: letters match in any case, as (?i)
+# multi_line:       ^ and $ match at line boundaries, as (?m)
+# dot_all:          . matches a newline, as (?s)
+# ungreedy:         repetition prefers fewer, as (?U)
+# longest:          leftmost-longest matching rather than leftmost-first
+# literal:          the pattern is literal text with no operators
+pub rec Options {
+    case_insensitive: bool;
+    multi_line:       bool;
+    dot_all:          bool;
+    ungreedy:         bool;
+    longest:          bool;
+    literal:          bool;
+}
+
+# a match's bounds
+# ---
+# start: the offset of its first byte
+# end:   the offset just past its last byte
+pub rec Match {
+    start: usize;
+    end:   usize;
+}
+
+# a compiled pattern
+# ---
+# a:       the allocator it lives in
+# prog:    its program
+# names:   the bytes of every group name, one after another
+# offsets: where each group's name starts in names, one more than the groups
+# longest: it matches leftmost-longest
+pub rec Regex {
+    a:       *A.Allocator;
+    prog:    Prog;
+    names:   Vector[u8];
+    offsets: Vector[usize];
+    longest: bool;
+}
+
+# the scratch of searching with one Regex
+# ---
+# vm: the pike vm's scratch
+pub rec Cache {
+    vm: pikevm.Cache;
+}
+
+# where a search for successive matches has reached
+# ---
+# from: where the next search begins
+# last: where the previous match ended, NONE before the first
+pub rec Iter {
+    from: usize;
+    last: usize;
+}
+
+# compile a pattern with the default options
+# ---
+# a:       the allocator the Regex lives in
+# pattern: the pattern's utf-8
+# ret:     the Regex, or the first error in the pattern
+pub fun compile(a: *A.Allocator, pattern: View) res[Regex, Error] {
+    var o: Options;
+    ret compile_with(a, pattern, o);
+}
+
+# compile a pattern with options
+# ---
+# a:       the allocator the Regex lives in
+# pattern: the pattern's utf-8
+# o:       how to compile it
+# ret:     the Regex, or the first error in the pattern
+pub fun compile_with(a: *A.Allocator, pattern: View, o: Options) res[Regex, Error] {
+    val flags: syntax.Flags                  = syntax.Flags{fold: o.case_insensitive, multiline: o.multi_line, dotnl: o.dot_all, ungreedy: o.ungreedy};
+    var tree:  res[syntax.Ast, syntax.Error] = syntax.parse(a, pattern, flags, o.literal);
+    if (sel tree.err) { ret res[Regex, Error].err{tree.err}; }
+    fin { syntax.dnit(?tree.ok); }
+    val p: res[Prog, Error] = program.compile(a, ?tree.ok);
+    if (sel p.err) { ret res[Regex, Error].err{p.err}; }
+    var re: Regex = Regex{a: a, prog: p.ok, names: vector.init[u8](a), offsets: vector.init[usize](a), longest: o.longest};
+    # names borrow the pattern, so the Regex keeps its own copy
+    var g:  usize = 0;
+    var ok: bool  = true;
+    for (g < tree.ok.names.len && ok) {
+        val started: res[usize, A.Error] = vector.push[usize](?re.offsets, re.names.len);
+        ok = sel started.ok;
+        val name: View  = tree.ok.names.data[g];
+        var k:    usize = 0;
+        for (k < name.len && ok) {
+            val pushed: res[usize, A.Error] = vector.push[u8](?re.names, name.data[k]);
+            ok = sel pushed.ok;
+            k  = k + 1;
+        }
+        g = g + 1;
+    }
+    if (ok) {
+        val pushed: res[usize, A.Error] = vector.push[usize](?re.offsets, re.names.len);
+        ok = sel pushed.ok;
+    }
+    if (!ok) {
+        dnit(?re);
+        ret res[Regex, Error].err{Error{kind: Kind.memory{}, offset: 0}};
+    }
+    ret res[Regex, Error].ok{re};
+}
+
+# release a Regex
+# ---
+# re: the Regex
+pub fun dnit(re: *Regex) {
+    program.dnit(?re.prog);
+    vector.dnit[u8](?re.names);
+    vector.dnit[usize](?re.offsets);
+}
+
+# the message for a compile error
+# ---
+# e:   the error
+# ret: a lowercase description, as RE2 words it
+pub fun error_text(e: Error) str {
+    ret syntax.text(e.kind);
+}
+
+# make the scratch for searching with a Regex
+# ---
+# a:   the allocator the scratch lives in
+# re:  the Regex it serves
+# ret: the Cache, or the memory error
+pub fun cache(a: *A.Allocator, re: *Regex) res[Cache, Error] {
+    var c: Cache;
+    if (!pikevm.init(a, ?re.prog, ?c.vm)) { ret res[Cache, Error].err{Error{kind: Kind.memory{}, offset: 0}}; }
+    ret res[Cache, Error].ok{c};
+}
+
+# release a Cache
+# ---
+# c: the Cache
+pub fun cache_dnit(c: *Cache) {
+    pikevm.dnit(?c.vm);
+}
+
+# the number of capturing groups, not counting the whole match
+# ---
+# re:  the Regex
+# ret: how many groups it captures
+pub fun group_count(re: *Regex) usize {
+    ret re.offsets.len - 2;
+}
+
+# the capture slots a captures call fills, two per group and two for the match
+# ---
+# re:  the Regex
+# ret: the number of slots
+pub fun slot_count(re: *Regex) usize {
+    ret re.prog.slots::usize;
+}
+
+# a group's name
+# ---
+# re:    the Regex
+# index: the group, from 1
+# ret:   its name, empty for an unnamed group or an index out of range
+pub fun group_name(re: *Regex, index: usize) View {
+    if (index + 1 >= re.offsets.len) { ret view(nil, 0); }
+    val start: usize = re.offsets.data[index];
+    ret view(?re.names.data[start], re.offsets.data[index + 1] - start);
+}
+
+# the index of a named group
+# ---
+# re:   the Regex
+# name: the name
+# ret:  the group's index, or none when no group has that name
+pub fun group_index(re: *Regex, name: View) opt[usize] {
+    if (name.len == 0) { ret opt[usize].none{}; }
+    var g: usize = 1;
+    for (g + 1 < re.offsets.len) {
+        val have: View = group_name(re, g);
+        if (have.len == name.len) {
+            var k:    usize = 0;
+            var same: bool  = true;
+            for (k < name.len && same) {
+                same = have.data[k] == name.data[k];
+                k    = k + 1;
+            }
+            if (same) { ret opt[usize].some{g}; }
+        }
+        g = g + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the first code point boundary at or after an offset
+fun aligned(text: View, from: usize) usize {
+    var at: usize = from;
+    for (at < text.len && (text.data[at] & 0xC0) == 0x80) { at = at + 1; }
+    ret at;
+}
+
+# whether the Regex matches anywhere in a text
+# ---
+# re:   the Regex
+# c:    a Cache made for it
+# text: the text
+# ret:  whether there is a match
+pub fun is_match(re: *Regex, c: *Cache, text: View) bool {
+    val m: opt[Match] = find(re, c, text, 0);
+    ret sel m.some;
+}
+
+# the leftmost match at or after an offset
+# ---
+# re:   the Regex
+# c:    a Cache made for it
+# text: the text
+# from: where to begin, moved forward to a code point boundary
+# ret:  the match, or none
+pub fun find(re: *Regex, c: *Cache, text: View, from: usize) opt[Match] {
+    if (from > text.len) { ret opt[Match].none{}; }
+    var bounds: [2]usize;
+    if (!pikevm.search(?re.prog, ?c.vm, text, aligned(text, from), false, re.longest, 2, ?bounds[0])) { ret opt[Match].none{}; }
+    ret opt[Match].some{Match{start: bounds[0], end: bounds[1]}};
+}
+
+# the leftmost match at or after an offset, with every group's bounds
+#
+# slots holds slot_count(re) offsets: slot 2n is group n's start and 2n+1 its
+# end, group 0 being the whole match, and NONE for a group that took no part.
+# ---
+# re:    the Regex
+# c:     a Cache made for it
+# text:  the text
+# from:  where to begin, moved forward to a code point boundary
+# slots: where the offsets go, slot_count(re) of them
+# ret:   whether there is a match
+pub fun captures(re: *Regex, c: *Cache, text: View, from: usize, slots: *usize) bool {
+    if (from > text.len) { ret false; }
+    ret pikevm.search(?re.prog, ?c.vm, text, aligned(text, from), false, re.longest, slot_count(re), slots);
+}
+
+# a search for successive matches from the start of a text
+# ---
+# ret: the Iter
+pub fun iter() Iter {
+    ret Iter{from: 0, last: NONE};
+}
+
+# the next match of a successive search, as Go's FindAll gives them
+#
+# an empty match directly after the previous match is skipped, and after an
+# empty match the search moves on by one code point.
+# ---
+# re:   the Regex
+# c:    a Cache made for it
+# text: the text
+# it:   where the search has reached
+# ret:  the match, or none when there are no more
+pub fun next(re: *Regex, c: *Cache, text: View, it: *Iter) opt[Match] {
+    for (it.from <= text.len) {
+        val found: opt[Match] = find(re, c, text, it.from);
+        if (sel found.none) {
+            it.from = text.len + 1;
+            ret found;
+        }
+        val m:      Match = found.some;
+        var accept: bool  = true;
+        if (m.end == m.start) {
+            # no empty match right after a match
+            if (m.start == it.last) { accept = false; }
+            it.from = aligned(text, m.end + 1);
+            if (m.end >= text.len) { it.from = text.len + 1; }
+        }
+        or {
+            it.from = m.end;
+        }
+        it.last = m.end;
+        if (accept) { ret found; }
+    }
+    ret opt[Match].none{};
+}
+
+# append a text with every metacharacter escaped, so it compiles to a pattern
+# that matches exactly that text
+# ---
+# text: the text
+# out:  where the escaped text is appended
+# ret:  false when the allocator refuses
+pub fun quote(text: View, out: *Vector[u8]) bool {
+    var k: usize = 0;
+    for (k < text.len) {
+        val b: u8 = text.data[k];
+        if (b == '\\' || b == '.' || b == '+' || b == '*' || b == '?' || b == '(' || b == ')' || b == '|' || b == '[' || b == ']' || b == '{' || b == '}' || b == '^' || b == '$') {
+            val escaped: res[usize, A.Error] = vector.push[u8](out, '\\');
+            if (sel escaped.err) { ret false; }
+        }
+        val pushed: res[usize, A.Error] = vector.push[u8](out, b);
+        if (sel pushed.err) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
