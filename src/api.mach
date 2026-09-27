@@ -24,6 +24,7 @@ use std.types.view.view;
 
 use program: regex.compile;
 use regex.compile.Prog;
+use regex.exec.backtrack;
 use regex.exec.dfa;
 use regex.exec.onepass;
 use regex.exec.pikevm;
@@ -82,11 +83,13 @@ pub rec Regex {
 # the scratch of searching with one Regex
 # ---
 # vm:  the pike vm's scratch
+# bt:  the bounded backtracker's scratch
 # one: the one-pass engine's scratch
 # fwd: the lazy dfa that finds where a match ends
 # bwd: the lazy dfa that finds where it begins
 pub rec Cache {
     vm:  pikevm.Cache;
+    bt:  backtrack.Cache;
     one: onepass.Cache;
     fwd: dfa.Dfa;
     bwd: dfa.Dfa;
@@ -187,17 +190,24 @@ pub fun cache(a: *A.Allocator, re: *Regex) res[Cache, Error] {
     var kind: dfa.Kind          = dfa.Kind.first{};
     if (re.longest)                       { kind = dfa.Kind.longest{}; }
     if (!pikevm.init(a, ?re.prog, ?c.vm)) { ret none; }
+    if (!backtrack.init(a, ?re.prog, ?c.bt)) {
+        pikevm.dnit(?c.vm);
+        ret none;
+    }
     if (!onepass.cache(a, ?re.prog, ?c.one)) {
         pikevm.dnit(?c.vm);
+        backtrack.dnit(?c.bt);
         ret none;
     }
     if (!dfa.init(a, ?re.prog, kind, false, ?c.fwd)) {
         pikevm.dnit(?c.vm);
+        backtrack.dnit(?c.bt);
         onepass.cache_dnit(?c.one);
         ret none;
     }
     if (!dfa.init(a, ?re.rev, dfa.Kind.all{}, true, ?c.bwd)) {
         pikevm.dnit(?c.vm);
+        backtrack.dnit(?c.bt);
         onepass.cache_dnit(?c.one);
         dfa.dnit(?c.fwd);
         ret none;
@@ -210,6 +220,7 @@ pub fun cache(a: *A.Allocator, re: *Regex) res[Cache, Error] {
 # c: the Cache
 pub fun cache_dnit(c: *Cache) {
     pikevm.dnit(?c.vm);
+    backtrack.dnit(?c.bt);
     onepass.cache_dnit(?c.one);
     dfa.dnit(?c.fwd);
     dfa.dnit(?c.bwd);
@@ -347,9 +358,12 @@ pub fun captures(re: *Regex, c: *Cache, text: View, from: usize, slots: *usize) 
     if (sel b.none) { ret false; }
     if (sel b.found) {
         # the match begins where the dfas found, so an anchored engine need only resolve its groups
-        if (re.onepass.ready) { ret onepass.search(?re.prog, ?re.onepass, ?c.one, text, b.found.start, re.longest, slot_count(re), slots); }
-        ret pikevm.search(?re.prog, ?c.vm, text, b.found.start, true, re.longest, slot_count(re), slots);
+        val start: usize = b.found.start;
+        if (re.onepass.ready)                        { ret onepass.search(?re.prog, ?re.onepass, ?c.one, text, start, re.longest, slot_count(re), slots); }
+        if (backtrack.fits(?c.bt, text.len - start)) { ret backtrack.search(?re.prog, ?c.bt, text, start, true, re.longest, slot_count(re), slots); }
+        ret pikevm.search(?re.prog, ?c.vm, text, start, true, re.longest, slot_count(re), slots);
     }
+    if (backtrack.fits(?c.bt, text.len - at)) { ret backtrack.search(?re.prog, ?c.bt, text, at, false, re.longest, slot_count(re), slots); }
     ret pikevm.search(?re.prog, ?c.vm, text, at, false, re.longest, slot_count(re), slots);
 }
 

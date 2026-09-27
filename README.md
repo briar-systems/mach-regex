@@ -4,8 +4,9 @@ Regular expressions for Mach with RE2's syntax and semantics.
 
 - **Linear time.** A search takes time proportional to the length of the
   pattern times the length of the text, whatever the pattern and whatever the
-  text. There is no backtracking, so no pattern can make a search run away, and
-  a pattern from an untrusted source is safe to compile and run.
+  text. No search visits the same instruction at the same place twice, so no
+  pattern can make a search run away, and a pattern from an untrusted source is
+  safe to compile and run.
 - **RE2 syntax.** Patterns mean what they mean in RE2 and Go's `regexp`,
   leftmost-first by default and leftmost-longest on request. The library is held
   to RE2's own search tests.
