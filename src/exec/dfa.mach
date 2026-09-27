@@ -51,6 +51,16 @@ pub val BUDGET: usize = 2097152;
 # a transition not yet computed, or a state that could not be made
 val UNKNOWN: u32 = 0xFFFFFFFF;
 
+# a transition is the next state's row offset, with tags above it for what the
+# search must stop and look at, so the loop tests one word per byte
+val OFFSET: u32 = 0x0FFFFFFF;
+# no thread is alive and new ones may start, so a prefix scan may skip ahead
+val IDLE: u32 = 0x10000000;
+# no thread is alive and none can start
+val DEAD: u32 = 0x20000000;
+# a match ended just before the byte
+val MATCHED: u32 = 0x40000000;
+
 # a list entry separating threads by where they started
 val MARK: u32 = 0xFFFFFFFE;
 
@@ -95,7 +105,7 @@ pub tag Outcome: u8 {
 # need:     the context flags the program's assertions read
 # cap:      the most states the arena holds
 # count:    states in use
-# trans:    each state's row of transitions, UNKNOWN where not yet computed
+# trans:    each state's row of transitions, tagged, UNKNOWN where not yet computed
 # lists:    where each state's list begins in the pool
 # lens:     each state's list length
 # flags:    each state's flags
@@ -103,7 +113,7 @@ pub tag Outcome: u8 {
 # pool:     the states' lists
 # used:     pool entries in use
 # table:    states by hash, open addressed, a state's index plus one or 0 for none
-# starts:   the start state for each context, UNKNOWN until made
+# starts:   the start state for each context, tagged, UNKNOWN until made
 # q:        the closure being taken, every instruction reached in order, with marks
 # qlen:     entries in q
 # at_q:     where each instruction sits in q, meaningful only for members
@@ -525,7 +535,7 @@ fun advance(d: *Dfa, p: *Prog, b: u8) {
 #
 # edge says the transition reads the edge of the text rather than b. when the
 # arena is full it is cleared and s made again, which is why s is a place.
-# ret: the state it leads to, or UNKNOWN to give up
+# ret: the state it leads to, tagged, or UNKNOWN to give up
 fun transition(d: *Dfa, p: *Prog, s: *u32, class: usize, b: u8, edge: bool, at: usize) u32 {
     var keep:    bool = false;
     val bits:    u8   = looks(d, d.flags.data[@s], edge, b);
@@ -561,11 +571,29 @@ fun transition(d: *Dfa, p: *Prog, s: *u32, class: usize, b: u8, edge: bool, at: 
         t = intern(d, ?d.out.data[0], d.olen, flags);
         if (t == UNKNOWN) { ret UNKNOWN; }
     }
-    d.trans.data[(@s)::usize * d.stride + class] = t;
+    val tagged: u32 = tag(d, t);
+    d.trans.data[(@s)::usize * d.stride + class] = tagged;
+    ret tagged;
+}
+
+# a state's row offset with its tags
+fun tag(d: *Dfa, s: u32) u32 {
+    var t:     u32 = s * d.stride::u32;
+    val flags: u32 = d.flags.data[s];
+    if ((flags & MATCH) != 0) { t = t | MATCHED; }
+    if (d.lens.data[s] == 0) {
+        if ((flags & START) != 0) { t = t | IDLE; }
+        or                        { t = t | DEAD; }
+    }
     ret t;
 }
 
-# the state a search starts in, given the context of the byte behind it
+# the state a tagged transition leads to
+fun state(d: *Dfa, t: u32) u32 {
+    ret (t & OFFSET) / d.stride::u32;
+}
+
+# the state a search starts in, tagged, given the context of the byte behind it
 fun start(d: *Dfa, p: *Prog, context: u32, anchored: bool) u32 {
     var flags: u32 = context & d.need;
     if (!anchored)                  { flags = flags | START; }
@@ -579,19 +607,14 @@ fun start(d: *Dfa, p: *Prog, context: u32, anchored: bool) u32 {
         s = intern(d, ?list[0], len, flags);
         if (s == UNKNOWN) { ret UNKNOWN; }
     }
-    d.starts[flags] = s;
-    ret s;
+    d.starts[flags] = tag(d, s);
+    ret d.starts[flags];
 }
 
 # the context of a text's byte at, or its edge
 fun context_at(d: *Dfa, text: View, at: usize, edge: bool) u32 {
     if (edge) { ret EDGE & d.need; }
     ret behind(d, text.data[at]);
-}
-
-# whether no thread is left and none can start
-fun dead(d: *Dfa, s: u32) bool {
-    ret d.lens.data[s] == 0 && (d.flags.data[s] & START) == 0;
 }
 
 # search forward for where the leftmost match ends
@@ -605,39 +628,52 @@ fun dead(d: *Dfa, s: u32) bool {
 pub fun forward(d: *Dfa, p: *Prog, text: View, from: usize, earliest: bool) Outcome {
     d.cleared = false;
     d.since   = from;
-    var s:    u32   = start(d, p, context_at(d, text, from - 1, from == 0), false);
-    var last: usize = NONE;
-    var at:   usize = from;
-    if (s == UNKNOWN) { ret Outcome.gave_up{}; }
+    val trans:   *u32  = d.trans.data;
+    val classes: *u8   = ?p.classes[0];
+    var h:       u32   = start(d, p, context_at(d, text, from - 1, from == 0), false);
+    var last:    usize = NONE;
+    var at:      usize = from;
+    if (h == UNKNOWN) { ret Outcome.gave_up{}; }
     for {
         # with no thread alive, no match can begin before the prefix's next occurrence
-        if (p.prefix_len > 0 && d.lens.data[s] == 0 && (d.flags.data[s] & START) != 0) {
+        if ((h & IDLE) != 0 && p.prefix_len > 0) {
             var next: usize = 0;
             if (!prefix.candidate(p, text, at, ?next)) { brk; }
             if (next != at) {
                 at = next;
-                s  = start(d, p, context_at(d, text, at - 1, false), false);
-                if (s == UNKNOWN) { ret Outcome.gave_up{}; }
+                h  = start(d, p, context_at(d, text, at - 1, false), false);
+                if (h == UNKNOWN) { ret Outcome.gave_up{}; }
             }
         }
         if (at >= text.len) {
-            var t: u32 = d.trans.data[s::usize * d.stride + d.stride - 1];
-            if (t == UNKNOWN)                   { t = transition(d, p, ?s, d.stride - 1, 0, true, at); }
-            if (t == UNKNOWN)                   { ret Outcome.gave_up{}; }
-            if ((d.flags.data[t] & MATCH) != 0) { last = at; }
+            var t: u32 = trans[(h & OFFSET)::usize + d.stride - 1];
+            if (t == UNKNOWN) {
+                var s: u32 = state(d, h);
+                t = transition(d, p, ?s, d.stride - 1, 0, true, at);
+            }
+            if (t == UNKNOWN)       { ret Outcome.gave_up{}; }
+            if ((t & MATCHED) != 0) { last = at; }
             brk;
         }
-        val b:     u8    = text.data[at];
-        val class: usize = p.classes[b]::usize;
-        var t:     u32   = d.trans.data[s::usize * d.stride + class];
-        if (t == UNKNOWN) { t = transition(d, p, ?s, class, b, false, at); }
-        if (t == UNKNOWN) { ret Outcome.gave_up{}; }
-        if ((d.flags.data[t] & MATCH) != 0) {
+        val b: u8  = text.data[at];
+        var t: u32 = trans[(h & OFFSET)::usize + classes[b]::usize];
+        # the common case: a known state with nothing to stop for
+        if (t < IDLE) {
+            h  = t;
+            at = at + 1;
+            cnt;
+        }
+        if (t == UNKNOWN) {
+            var s: u32 = state(d, h);
+            t = transition(d, p, ?s, classes[b]::usize, b, false, at);
+            if (t == UNKNOWN) { ret Outcome.gave_up{}; }
+        }
+        if ((t & MATCHED) != 0) {
             last = at;
             if (earliest) { brk; }
         }
-        if (dead(d, t)) { brk; }
-        s  = t;
+        if ((t & DEAD) != 0) { brk; }
+        h  = t;
         at = at + 1;
     }
     if (last == NONE) { ret Outcome.none{}; }
@@ -655,32 +691,45 @@ pub fun forward(d: *Dfa, p: *Prog, text: View, from: usize, earliest: bool) Outc
 pub fun backward(d: *Dfa, p: *Prog, text: View, from: usize, end: usize) Outcome {
     d.cleared = false;
     d.since   = end;
-    var s:    u32   = start(d, p, context_at(d, text, end, end == text.len), true);
-    var last: usize = NONE;
-    var at:   usize = end;
-    if (s == UNKNOWN) { ret Outcome.gave_up{}; }
+    val trans:   *u32  = d.trans.data;
+    val classes: *u8   = ?p.classes[0];
+    var h:       u32   = start(d, p, context_at(d, text, end, end == text.len), true);
+    var last:    usize = NONE;
+    var at:      usize = end;
+    if (h == UNKNOWN) { ret Outcome.gave_up{}; }
     for {
         if (at == from) {
             if (at == 0) {
-                var t: u32 = d.trans.data[s::usize * d.stride + d.stride - 1];
-                if (t == UNKNOWN)                   { t = transition(d, p, ?s, d.stride - 1, 0, true, at); }
-                if (t == UNKNOWN)                   { ret Outcome.gave_up{}; }
-                if ((d.flags.data[t] & MATCH) != 0) { last = at; }
+                var t: u32 = trans[(h & OFFSET)::usize + d.stride - 1];
+                if (t == UNKNOWN) {
+                    var s: u32 = state(d, h);
+                    t = transition(d, p, ?s, d.stride - 1, 0, true, at);
+                }
+                if (t == UNKNOWN)       { ret Outcome.gave_up{}; }
+                if ((t & MATCHED) != 0) { last = at; }
                 brk;
             }
             # a match may not begin before from, but the byte behind it still decides assertions
+            val s:    u32  = state(d, h);
             var keep: bool = false;
             if (expand(d, p, s, looks(d, d.flags.data[s], false, text.data[at - 1]), false, ?keep)) { last = at; }
             brk;
         }
-        val b:     u8    = text.data[at - 1];
-        val class: usize = p.classes[b]::usize;
-        var t:     u32   = d.trans.data[s::usize * d.stride + class];
-        if (t == UNKNOWN)                   { t = transition(d, p, ?s, class, b, false, at); }
-        if (t == UNKNOWN)                   { ret Outcome.gave_up{}; }
-        if ((d.flags.data[t] & MATCH) != 0) { last = at; }
-        if (dead(d, t))                     { brk; }
-        s  = t;
+        val b: u8  = text.data[at - 1];
+        var t: u32 = trans[(h & OFFSET)::usize + classes[b]::usize];
+        if (t < IDLE) {
+            h  = t;
+            at = at - 1;
+            cnt;
+        }
+        if (t == UNKNOWN) {
+            var s: u32 = state(d, h);
+            t = transition(d, p, ?s, classes[b]::usize, b, false, at);
+            if (t == UNKNOWN) { ret Outcome.gave_up{}; }
+        }
+        if ((t & MATCHED) != 0) { last = at; }
+        if ((t & DEAD) != 0)    { brk; }
+        h  = t;
         at = at - 1;
     }
     if (last == NONE) { ret Outcome.none{}; }
