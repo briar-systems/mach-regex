@@ -10,6 +10,7 @@ use regex.compile.utf8;
 
 fwd compiler.compile;
 fwd compiler.MAX_INSTS;
+fwd compiler.reverse;
 fwd prog.Assert;
 fwd prog.Inst;
 fwd prog.Look;
