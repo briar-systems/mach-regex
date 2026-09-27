@@ -1,6 +1,5 @@
-# the README's examples, each a program of its own
 [project]
-id = "readme"
+id = "options"
 version = "0.1.0"
 mach = "^6"
 src = "src"
@@ -31,37 +30,21 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
-[artifact.search]
-kind = "bin"
-entry = "bin/search.mach"
-out = "bin/search"
-targets = ["*"]
-link = []
-need = []
-
-[artifact.captures]
-kind = "bin"
-entry = "bin/captures.mach"
-out = "bin/captures"
-targets = ["*"]
-link = []
-need = []
-
-[artifact.iterate]
-kind = "bin"
-entry = "bin/iterate.mach"
-out = "bin/iterate"
-targets = ["*"]
-link = []
-need = []
-
 [artifact.options]
 kind = "bin"
 entry = "bin/options.mach"
-out = "bin/options"
+out = "bin/options{artifact.suffix}"
 targets = ["*"]
-link = []
+link = ["kernel32"]
 need = []
+
+[link.kernel32]
+source = "system"
+name = "kernel32.dll"
+os = ["windows"]
+isa = ["*"]
+abi = ["*"]
+export = false
 
 [profile.debug]
 default = true
@@ -78,6 +61,7 @@ simd = "scalarize"
 vectorize = true
 float_reassoc = false
 
+# the library from this checkout, and std through the library's own pin
 [dep.regex]
 path = "../.."
 

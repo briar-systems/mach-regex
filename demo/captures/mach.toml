@@ -1,6 +1,6 @@
 [project]
-id = "regex"
-version = "0.2.0"
+id = "captures"
+version = "0.1.0"
 mach = "^6"
 src = "src"
 out = "out/{target.name}/{profile.name}"
@@ -30,21 +30,10 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
-# the library. as the default, its entry is what a dependent's `use regex;` binds
-[artifact.regex]
-kind = "static"
-default = true
-entry = "lib/regex.mach"
-out = "lib/regex"
-targets = ["*"]
-link = []
-need = []
-
-# a rebar runner, for benchmarking against other engines with rebar
-[artifact.rebar]
+[artifact.captures]
 kind = "bin"
-entry = "bin/rebar.mach"
-out = "bin/rebar{artifact.suffix}"
+entry = "bin/captures.mach"
+out = "bin/captures{artifact.suffix}"
 targets = ["*"]
 link = ["kernel32"]
 need = []
@@ -72,6 +61,9 @@ simd = "scalarize"
 vectorize = true
 float_reassoc = false
 
+# the library from this checkout, and std through the library's own pin
+[dep.regex]
+path = "../.."
+
 [dep.std]
-git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+path = "../../dep/std"

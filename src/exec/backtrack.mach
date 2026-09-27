@@ -1,0 +1,577 @@
+# the bounded backtracker: the program depth first, each state entered once
+#
+# a search follows the program's paths from each start in priority order, as a
+# backtracking matcher does, but marks every instruction and position it
+# enters in a bitset and never enters one twice. what follows a state depends
+# only on the state, so a state already entered can add nothing, and a search
+# takes time proportional to the program times the span, whatever the pattern.
+# the bitset holds one bit per state and the stack cannot grow, so the
+# backtracker applies only when the program's instructions times the span plus
+# one fit CAPACITY and the worst case of its frames fits STACK. it gives
+# exactly what the pike vm gives for the same arguments, captures included,
+# under leftmost-first and leftmost-longest. all scratch is in a Cache sized
+# when it is made, so a search makes no allocation.
+
+use A: std.allocator;
+use std.allocator.heap;
+use std.allocator.testing;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use program: regex.compile;
+use regex.compile.program.Assert;
+use regex.compile.program.Inst;
+use regex.compile.program.Prog;
+use regex.compile.program.Trans;
+use regex.exec.pikevm;
+use regex.syntax;
+
+# a capture slot no path has set
+pub val NONE: usize = 0xFFFFFFFFFFFFFFFF;
+
+# the most states, instructions times positions, a search may cover, as in
+# RE2's bitstate
+pub val CAPACITY: usize = 256 * 1024;
+
+# the most frames a cache's stack holds, 128 KiB of them
+#
+# the stack cannot grow during a search, so a search may cover only as many
+# positions as the worst case of the program's pushing instructions fits.
+pub val STACK: usize = 16 * 1024;
+
+# marks a restore frame in a frame's first word
+val RESTORE: u32 = 0x80000000;
+
+# a slot value no path has set, as a frame holds it
+val UNSET: u32 = 0xFFFFFFFF;
+
+# one pending step
+#
+# an explore frame holds an instruction and a position, a restore frame the
+# slot, marked with RESTORE, and the value to put back. positions are
+# relative to the search's start.
+# ---
+# a: the instruction, or the slot marked with RESTORE
+# b: the position, or the slot's value
+rec Frame {
+    a: u32;
+    b: u32;
+}
+
+# the scratch of a search, sized for one program
+# ---
+# visited:   one bit per state, instruction major
+# stack:     the pending frames
+# slots:     the slots of the path being followed
+# best:      the slots of the longest match so far
+# size:      the program's instruction count it was sized for
+# positions: the most positions a search may cover, the span plus one
+pub rec Cache {
+    visited:   Vector[u64];
+    stack:     Vector[Frame];
+    slots:     Vector[usize];
+    best:      Vector[usize];
+    size:      usize;
+    positions: usize;
+}
+
+# whether a search over a span fits the bitset and the stack
+# ---
+# c:    a cache made for the program
+# span: the bytes from the search's start to the end of the text
+# ret:  whether the backtracker can search it
+pub fun fits(c: *Cache, span: usize) bool {
+    ret span < c.positions;
+}
+
+# make the scratch for searching a program
+# ---
+# a:   the allocator the scratch lives in
+# p:   the program
+# c:   the cache to fill
+# ret: false when the allocator refuses, leaving nothing held
+pub fun init(a: *A.Allocator, p: *Prog, c: *Cache) bool {
+    val size: usize = p.insts.len;
+    c.size    = size;
+    c.visited = vector.init[u64](a);
+    c.stack   = vector.init[Frame](a);
+    c.slots   = vector.init[usize](a);
+    c.best    = vector.init[usize](a);
+    # only a split or a save pushes a frame, at most one per state it enters
+    var pushers: usize = 0;
+    var k:       usize = 0;
+    for (k < size) {
+        val i: Inst = p.insts.data[k];
+        if (sel i.split || sel i.save) { pushers = pushers + 1; }
+        k = k + 1;
+    }
+    var positions: usize = 0;
+    if (size > 0)                                       { positions = CAPACITY / size; }
+    if (pushers > 0 && pushers * positions + 1 > STACK) { positions = (STACK - 1) / pushers; }
+    c.positions = positions;
+    val visited: res[usize, A.Error] = vector.ensure[u64](?c.visited, (CAPACITY + 63) / 64);
+    val stack:   res[usize, A.Error] = vector.ensure[Frame](?c.stack, pushers * positions + 1);
+    val slots:   res[usize, A.Error] = vector.ensure[usize](?c.slots, p.slots::usize);
+    val best:    res[usize, A.Error] = vector.ensure[usize](?c.best, p.slots::usize);
+    if (sel visited.err || sel stack.err || sel slots.err || sel best.err) {
+        dnit(c);
+        ret false;
+    }
+    ret true;
+}
+
+# release a cache's scratch
+# ---
+# c: the cache
+pub fun dnit(c: *Cache) {
+    vector.dnit[u64](?c.visited);
+    vector.dnit[Frame](?c.stack);
+    vector.dnit[usize](?c.slots);
+    vector.dnit[usize](?c.best);
+}
+
+fun is_word(b: u8) bool {
+    ret (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_';
+}
+
+# whether an assertion holds at a position of the text
+fun holds(a: Assert, text: View, at: usize) bool {
+    if (sel a.begin_text) { ret at == 0; }
+    if (sel a.end_text)   { ret at == text.len; }
+    if (sel a.begin_line) { ret at == 0 || text.data[at - 1] == '\n'; }
+    if (sel a.end_line)   { ret at == text.len || text.data[at] == '\n'; }
+    val before: bool = at > 0 && is_word(text.data[at - 1]);
+    val after:  bool = at < text.len && is_word(text.data[at]);
+    if (sel a.word_boundary) { ret before != after; }
+    ret before == after;
+}
+
+# whether a position does not split a utf-8 sequence
+fun boundary(text: View, at: usize) bool {
+    ret at == 0 || at >= text.len || (text.data[at] & 0xC0) != 0x80;
+}
+
+# the successor of a byte through a sparse instruction's transitions, or none
+fun through(p: *Prog, start: u32, len: u32, b: u8, next: *u32) bool {
+    var lo: u32 = 0;
+    var hi: u32 = len;
+    for (lo < hi) {
+        val mid: u32   = lo + (hi - lo) / 2;
+        val t:   Trans = p.trans.data[start + mid];
+        if (b < t.lo) {
+            hi = mid;
+        }
+        or (b > t.hi) {
+            lo = mid + 1;
+        }
+        or {
+            @next = t.next;
+            ret true;
+        }
+    }
+    ret false;
+}
+
+# whether the program's required prefix begins at a position
+fun prefixed(p: *Prog, text: View, at: usize) bool {
+    val n: usize = p.prefix_len::usize;
+    if (at + n > text.len) { ret false; }
+    var k: usize = 0;
+    for (k < n && text.data[at + k] == p.prefix[k]) { k = k + 1; }
+    ret k == n;
+}
+
+fun push(c: *Cache, depth: *usize, a: u32, b: u32) {
+    c.stack.data[@depth] = Frame{a: a, b: b};
+    @depth               = @depth + 1;
+}
+
+# follow every path from one start, in priority order
+#
+# leftmost-first stops at the first match, which the path's slots hold.
+# leftmost-longest follows every path and keeps the first to reach the
+# furthest match in best. positions in the bitset and in frames are relative
+# to base, and a state's bit is at its instruction times width plus its
+# position. no byte at or past limit is read.
+fun run(p: *Prog, c: *Cache, text: View, limit: usize, base: usize, width: usize, from: usize, longest: bool, active: usize, matched: *bool) bool {
+    var depth: usize = 0;
+    push(c, ?depth, p.start, (from - base)::u32);
+    for (depth > 0) {
+        depth = depth - 1;
+        val f: Frame = c.stack.data[depth];
+        if ((f.a & RESTORE) != 0) {
+            var value: usize = NONE;
+            if (f.b != UNSET) { value = base + f.b::usize; }
+            c.slots.data[f.a & ~RESTORE] = value;
+            cnt;
+        }
+        var pc: u32   = f.a;
+        var at: usize = base + f.b::usize;
+        for {
+            val bit:  usize = pc::usize * width + (at - base);
+            val word: *u64  = ?c.visited.data[bit / 64];
+            val mask: u64   = 1u64 << (bit % 64)::u64;
+            if ((@word & mask) != 0) { brk; }
+            @word = @word | mask;
+            val i: Inst = p.insts.data[pc];
+            if (sel i.split) {
+                push(c, ?depth, i.split.y, (at - base)::u32);
+                pc = i.split.x;
+                cnt;
+            }
+            if (sel i.save) {
+                if (i.save.slot::usize < active) {
+                    val old:  usize = c.slots.data[i.save.slot];
+                    var kept: u32   = UNSET;
+                    if (old != NONE) { kept = (old - base)::u32; }
+                    push(c, ?depth, i.save.slot | RESTORE, kept);
+                    c.slots.data[i.save.slot] = at;
+                }
+                pc = i.save.next;
+                cnt;
+            }
+            if (sel i.look) {
+                if (!holds(i.look.assert, text, at)) { brk; }
+                pc = i.look.next;
+                cnt;
+            }
+            if (sel i.match) {
+                if (!longest) { ret true; }
+                if (!@matched || at > c.best.data[1]) {
+                    var k: usize = 0;
+                    for (k < active) {
+                        c.best.data[k] = c.slots.data[k];
+                        k              = k + 1;
+                    }
+                    @matched = true;
+                }
+                brk;
+            }
+            if (at >= limit) { brk; }
+            val b: u8 = text.data[at];
+            if (sel i.range) {
+                if (b < i.range.lo || b > i.range.hi) { brk; }
+                pc = i.range.next;
+                at = at + 1;
+                cnt;
+            }
+            if (sel i.sparse) {
+                var next: u32 = 0;
+                if (!through(p, i.sparse.start, i.sparse.len, b, ?next)) { brk; }
+                pc = next;
+                at = at + 1;
+                cnt;
+            }
+            brk;
+        }
+    }
+    ret false;
+}
+
+# search a text for the program's match, as the pike vm does
+#
+# the arguments and the result are the pike vm's, and so is the match. the
+# search must fit: fits(c, text.len - start).
+# ---
+# p:        the program
+# c:        scratch sized for the program
+# text:     the text
+# start:    where the search begins, a code point boundary
+# anchored: a match must begin at start
+# longest:  leftmost-longest rather than leftmost-first
+# active:   how many slots to record, at least 2 and at most the program's
+# out:      where the slots of the match go, active of them
+# ret:      whether there is a match
+pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, longest: bool, active: usize, out: *usize) bool {
+    ret search_within(p, c, text, start, text.len, anchored, longest, active, out);
+}
+
+# search a text for the program's match, reading no byte at or past limit
+#
+# assertions still see the whole text, so a match known to end by limit is
+# found with the same groups, as when the lazy dfas have found its bounds. the
+# search must fit: fits(c, limit - start).
+# ---
+# p:        the program
+# c:        scratch sized for the program
+# text:     the text
+# start:    where the search begins, a code point boundary
+# limit:    where reading stops, at most the text's length
+# anchored: a match must begin at start
+# longest:  leftmost-longest rather than leftmost-first
+# active:   how many slots to record, at least 2 and at most the program's
+# out:      where the slots of the match go, active of them
+# ret:      whether there is a match
+pub fun search_within(p: *Prog, c: *Cache, text: View, start: usize, limit: usize, anchored: bool, longest: bool, active: usize, out: *usize) bool {
+    val width: usize = limit - start + 1;
+    val words: usize = (c.size * width + 63) / 64;
+    var k:     usize = 0;
+    for (k < words) {
+        c.visited.data[k] = 0;
+        k                 = k + 1;
+    }
+    var matched: bool  = false;
+    var found:   bool  = false;
+    var at:      usize = start;
+    for (at <= limit && !found && !matched) {
+        # a match must begin with the prefix, so no other start can find one
+        if (boundary(text, at) && (p.prefix_len == 0 || prefixed(p, text, at))) {
+            k = 0;
+            for (k < active) {
+                c.slots.data[k] = NONE;
+                k               = k + 1;
+            }
+            found = run(p, c, text, limit, start, width, at, longest, active, ?matched);
+        }
+        if (anchored) { brk; }
+        at = at + 1;
+    }
+    if (!found && !matched) { ret false; }
+    var from: *usize = c.slots.data;
+    if (matched) { from = c.best.data; }
+    k = 0;
+    for (k < active) {
+        out[k] = from[k];
+        k      = k + 1;
+    }
+    ret true;
+}
+
+# RE2's search data, for its patterns and texts
+#[embed("../data/re2-search.txt")]
+val DATA: [_]u8;
+
+#[testing]
+fun hex(c: u8) u8 {
+    if (c >= '0' && c <= '9') { ret c - '0'; }
+    if (c >= 'a' && c <= 'f') { ret c - 'a' + 10; }
+    ret c - 'A' + 10;
+}
+
+# append a go-quoted string, its quotes included in line, unquoted
+#[testing]
+fun unquote(line: View, out: *Vector[u8]) {
+    var i: usize = 1;
+    for (i + 1 < line.len) {
+        var c: u8 = line.data[i];
+        i = i + 1;
+        if (c == '\\') {
+            val e: u8 = line.data[i];
+            i = i + 1;
+            c = e;
+            if (e == 'n') { c = '\n'; }
+            or (e == 't') { c = '\t'; }
+            or (e == 'r') { c = '\r'; }
+            or (e == 'x') {
+                c = hex(line.data[i]) * 16 + hex(line.data[i + 1]);
+                i = i + 2;
+            }
+        }
+        vector.push[u8](out, c);
+    }
+}
+
+# a program with both engines' scratch
+rec Engines {
+    tree: syntax.Ast;
+    prog: Prog;
+    vm:   pikevm.Cache;
+    bt:   Cache;
+    ok:   bool;
+}
+
+#[testing]
+fun open(a: *A.Allocator, e: *Engines, pattern: View) {
+    var flags: syntax.Flags;
+    val tree:  res[syntax.Ast, syntax.Error] = syntax.parse(a, pattern, flags, false);
+    e.ok = false;
+    if (sel tree.err) { ret; }
+    e.tree = tree.ok;
+    val p: res[Prog, syntax.Error] = program.compile(a, ?e.tree);
+    if (sel p.err) {
+        syntax.dnit(?e.tree);
+        ret;
+    }
+    e.prog = p.ok;
+    if (!pikevm.init(a, ?e.prog, ?e.vm)) { ret; }
+    if (!init(a, ?e.prog, ?e.bt))        { ret; }
+    e.ok = true;
+}
+
+#[testing]
+fun close(e: *Engines) {
+    if (!e.ok) { ret; }
+    dnit(?e.bt);
+    pikevm.dnit(?e.vm);
+    program.dnit(?e.prog);
+    syntax.dnit(?e.tree);
+    e.ok = false;
+}
+
+# whether both engines give the same answer for one search
+#[testing]
+fun agrees(e: *Engines, text: View, start: usize, anchored: bool, longest: bool, active: usize) bool {
+    var want: [64]usize;
+    var got:  [64]usize;
+    val a:    bool = pikevm.search(?e.prog, ?e.vm, text, start, anchored, longest, active, ?want[0]);
+    val b:    bool = search(?e.prog, ?e.bt, text, start, anchored, longest, active, ?got[0]);
+    if (a != b) { ret false; }
+    var k: usize = 0;
+    for (a && k < active) {
+        if (want[k] != got[k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# every search of a text both engines can run, from every start, in every mode
+#[testing]
+fun agree_all(e: *Engines, text: View) usize {
+    var failures: usize = 0;
+    val slots:    usize = e.prog.slots::usize;
+    var start:    usize = 0;
+    for (start <= text.len) {
+        if (!boundary(text, start) || !fits(?e.bt, text.len - start)) {
+            start = start + 1;
+            cnt;
+        }
+        var mode: usize = 0;
+        for (mode < 8) {
+            var active: usize = 2;
+            if (mode >= 4)                                                                         { active = slots; }
+            if (active <= 64 && !agrees(e, text, start, (mode & 1) != 0, (mode & 2) != 0, active)) { failures = failures + 1; }
+            mode = mode + 1;
+        }
+        start = start + 1;
+    }
+    ret failures;
+}
+
+test search__agrees_with_the_pike_vm_over_re2_data {
+    var src: heap.Source;
+    var h:   heap.Heap;
+    var a:   A.Allocator;
+    heap.native_source(?src);
+    heap.init(?h, ?src, 0);
+    heap.make(?a, ?h);
+    var texts:    Vector[u8]    = vector.init[u8](?a);
+    var starts:   Vector[usize] = vector.init[usize](?a);
+    var pattern:  Vector[u8]    = vector.init[u8](?a);
+    var wrapped:  Vector[u8]    = vector.init[u8](?a);
+    var state:    u8            = 0;
+    var failures: usize         = 0;
+    var patterns: usize         = 0;
+    val len:      usize         = $length_of(DATA);
+    var i:        usize         = 0;
+    for (i < len) {
+        var end: usize = i;
+        for (end < len && DATA[end] != '\n') { end = end + 1; }
+        val line: View = view(?DATA[i], end - i);
+        i = end + 1;
+        if (line.len == 7 && line.data[0] == 's') {
+            state      = 1;
+            texts.len  = 0;
+            starts.len = 0;
+            cnt;
+        }
+        if (line.len == 7 && line.data[0] == 'r') {
+            state = 2;
+            vector.push[usize](?starts, texts.len);
+            cnt;
+        }
+        if (line.len == 0 || line.data[0] != '"') { cnt; }
+        if (state == 1) {
+            vector.push[usize](?starts, texts.len);
+            unquote(line, ?texts);
+            cnt;
+        }
+        # a pattern, run bare and as a full match over every text of its stanza
+        pattern.len = 0;
+        unquote(line, ?pattern);
+        wrapped.len = 0;
+        val open_full: str   = "^(?:";
+        var k:         usize = 0;
+        for (k < 4) {
+            vector.push[u8](?wrapped, open_full[k]);
+            k = k + 1;
+        }
+        k = 0;
+        for (k < pattern.len) {
+            vector.push[u8](?wrapped, pattern.data[k]);
+            k = k + 1;
+        }
+        vector.push[u8](?wrapped, ')');
+        vector.push[u8](?wrapped, '$');
+        var w: usize = 0;
+        for (w < 2) {
+            var src: View = view(pattern.data, pattern.len);
+            if (w == 1) { src = view(wrapped.data, wrapped.len); }
+            var e: Engines;
+            open(?a, ?e, src);
+            if (e.ok) {
+                patterns = patterns + 1;
+                var t: usize = 0;
+                for (t + 1 < starts.len) {
+                    val text: View  = view(?texts.data[starts.data[t]], starts.data[t + 1] - starts.data[t]);
+                    val bad:  usize = agree_all(?e, text);
+                    if (bad > 0) { print.eprintlnf("pattern {} text {}: {} disagreements", patterns, t, bad); }
+                    failures = failures + bad;
+                    t        = t + 1;
+                }
+            }
+            close(?e);
+            w = w + 1;
+        }
+    }
+    vector.dnit[u8](?texts);
+    vector.dnit[usize](?starts);
+    vector.dnit[u8](?pattern);
+    vector.dnit[u8](?wrapped);
+    print.eprintlnf("{} programs, {} disagreements", patterns, failures);
+    if (failures > 0)   { ret 1; }
+    if (patterns < 100) { ret 2; }
+    ret 0;
+}
+
+# open a pattern given as a string
+#[testing]
+fun open_str(a: *A.Allocator, e: *Engines, pattern: str) {
+    open(a, e, view(pattern, str_len(pattern)));
+}
+
+test search__linear_at_capacity {
+    var t: testing.Testing;
+    testing.make(?t);
+    val a: *A.Allocator = testing.allocator_of(?t);
+    var e: Engines;
+    open_str(a, ?e, "(a*)*(b)");
+    if (!e.ok) { ret 1; }
+    # the longest run of a that fits, with no b for the exponential paths to find
+    var run:  [65536]u8;
+    var span: usize = 0;
+    for (span < 65536 && fits(?e.bt, span + 1)) {
+        run[span] = 'a';
+        span      = span + 1;
+    }
+    if (span == 0 || span >= 65536 || fits(?e.bt, span + 1)) { ret 2; }
+    var out: [6]usize;
+    if (search(?e.prog, ?e.bt, view(?run[0], span), 0, false, false, 6, ?out[0])) { ret 3; }
+    # and with the b at the end, both engines resolve the same captures
+    run[span - 1] = 'b';
+    if (!agrees(?e, view(?run[0], span), 0, false, false, 6)) { ret 4; }
+    if (!agrees(?e, view(?run[0], span), 0, false, true, 6))  { ret 5; }
+    close(?e);
+    if (testing.leaked(?t)) { ret 6; }
+    testing.dnit(?t);
+    ret 0;
+}

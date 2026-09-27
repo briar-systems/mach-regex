@@ -1,0 +1,363 @@
+# a rebar runner for mach-regex
+#
+# reads one benchmark as KLV on stdin, runs its model and prints every sample as
+# the nanoseconds it took and the count it found, one per line. `version` prints
+# the runner's version. see https://github.com/BurntSushi/rebar
+
+use std.allocator;
+use std.allocator.heap;
+use std.chrono.time;
+use std.chrono.time.Instant;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.filesystem;
+use std.io.reader;
+use std.print;
+use std.process.exec;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use regex.lib.regex;
+
+rec Config {
+    name:             View;
+    model:            View;
+    pattern:          View;
+    patterns:         usize;
+    fold:             bool;
+    haystack:         View;
+    max_iters:        u64;
+    max_warmup_iters: u64;
+    max_time:         i64;
+    max_warmup_time:  i64;
+}
+
+rec Sample {
+    ns:    i64;
+    count: u64;
+}
+
+rec Bench {
+    c:     *Config;
+    a:     *allocator.Allocator;
+    re:    regex.Regex;
+    cache: regex.Cache;
+    slots: Vector[usize];
+}
+
+fun equals(v: View, s: str) bool {
+    val n: usize = str_len(s);
+    if (v.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun decimal(v: View) u64 {
+    var n: u64   = 0;
+    var i: usize = 0;
+    for (i < v.len) {
+        n = n * 10 + (v.data[i] - '0')::u64;
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun field(raw: View, at: *usize) View {
+    val start: usize = @at;
+    for (@at < raw.len && raw.data[@at] != ':') { @at = @at + 1; }
+    ret view(?raw.data[start], @at - start);
+}
+
+# ret: false when the input is not well formed or names an unknown key
+fun parse(raw: View, c: *Config) bool {
+    var at: usize = 0;
+    for (at < raw.len) {
+        val key: View = field(raw, ?at);
+        if (at >= raw.len) { ret false; }
+        at = at + 1;
+        val len: usize = decimal(field(raw, ?at))::usize;
+        if (at >= raw.len) { ret false; }
+        at = at + 1;
+        if (at + len >= raw.len || raw.data[at + len] != '\n') { ret false; }
+        val value: View = view(?raw.data[at], len);
+        at = at + len + 1;
+        if (equals(key, "name"))  { c.name = value; }
+        or (equals(key, "model")) { c.model = value; }
+        or (equals(key, "pattern")) {
+            c.pattern  = value;
+            c.patterns = c.patterns + 1;
+        }
+        or (equals(key, "case-insensitive")) { c.fold = equals(value, "true"); }
+        or (equals(key, "unicode")) {
+            # like Go, mach-regex is always unicode aware and its perl classes ascii
+        }
+        or (equals(key, "haystack"))         { c.haystack = value; }
+        or (equals(key, "max-iters"))        { c.max_iters = decimal(value); }
+        or (equals(key, "max-warmup-iters")) { c.max_warmup_iters = decimal(value); }
+        or (equals(key, "max-time"))         { c.max_time = decimal(value)::i64; }
+        or (equals(key, "max-warmup-time"))  { c.max_warmup_time = decimal(value)::i64; }
+        or                                   { ret false; }
+    }
+    ret true;
+}
+
+# a sample without a clock means nothing, so a clock that fails ends the run
+fun now() Instant {
+    val t: time.InstantClock = time.instant();
+    if (sel t.ok) { ret t.ok; }
+    print.eprintln("the monotonic clock failed");
+    exec.exit(1);
+    # unreachable, exit does not return
+    ret Instant{sec: 0, nsec: 0};
+}
+
+fun since(start: Instant) i64 {
+    ret time.instant_sub(now(), start);
+}
+
+# the next code point boundary at or after at
+fun aligned(text: View, at: usize) usize {
+    var i: usize = at;
+    for (i < text.len && (text.data[i] & 0xC0) == 0x80) { i = i + 1; }
+    ret i;
+}
+
+# every participating group of every match in text, walked as regex.next walks
+fun groups_in(b: *Bench, text: View) u64 {
+    val groups: usize = regex.slot_count(?b.re) / 2;
+    var from:   usize = 0;
+    var last:   usize = regex.NONE;
+    var n:      u64   = 0;
+    for (from <= text.len) {
+        if (!regex.captures(?b.re, ?b.cache, text, from, b.slots.data)) { brk; }
+        val start:  usize = b.slots.data[0];
+        val end:    usize = b.slots.data[1];
+        var accept: bool  = true;
+        if (end == start) {
+            if (start == last) { accept = false; }
+            from = aligned(text, end + 1);
+            if (end >= text.len) { from = text.len + 1; }
+        }
+        or {
+            from = end;
+        }
+        last = end;
+        if (accept) {
+            var g: usize = 0;
+            for (g < groups) {
+                if (b.slots.data[2 * g] != regex.NONE) { n = n + 1; }
+                g = g + 1;
+            }
+        }
+    }
+    ret n;
+}
+
+fun count(b: *Bench) u64 {
+    var it: regex.Iter = regex.iter();
+    var n:  u64        = 0;
+    for {
+        val m: opt[regex.Match] = regex.next(?b.re, ?b.cache, b.c.haystack, ?it);
+        if (sel m.none) { brk; }
+        n = n + 1;
+    }
+    ret n;
+}
+
+fun count_spans(b: *Bench) u64 {
+    var it: regex.Iter = regex.iter();
+    var n:  u64        = 0;
+    for {
+        val m: opt[regex.Match] = regex.next(?b.re, ?b.cache, b.c.haystack, ?it);
+        if (sel m.none) { brk; }
+        n = n + (m.some.end - m.some.start)::u64;
+    }
+    ret n;
+}
+
+fun count_captures(b: *Bench) u64 {
+    ret groups_in(b, b.c.haystack);
+}
+
+# each line of the haystack in turn, without its terminator, as a grep reads it
+fun line(h: View, at: *usize) View {
+    val start: usize = @at;
+    for (@at < h.len && h.data[@at] != '\n') { @at = @at + 1; }
+    var end: usize = @at;
+    @at = @at + 1;
+    if (end > start && h.data[end - 1] == '\r') { end = end - 1; }
+    ret view(?h.data[start], end - start);
+}
+
+fun grep(b: *Bench) u64 {
+    val h:  View  = b.c.haystack;
+    var at: usize = 0;
+    var n:  u64   = 0;
+    for (at < h.len) {
+        if (regex.is_match(?b.re, ?b.cache, line(h, ?at))) { n = n + 1; }
+    }
+    ret n;
+}
+
+fun grep_captures(b: *Bench) u64 {
+    val h:  View  = b.c.haystack;
+    var at: usize = 0;
+    var n:  u64   = 0;
+    for (at < h.len) {
+        n = n + groups_in(b, line(h, ?at));
+    }
+    ret n;
+}
+
+fun options(c: *Config) regex.Options {
+    var o: regex.Options;
+    o.case_insensitive = c.fold;
+    ret o;
+}
+
+fun push(out: *Vector[Sample], ns: i64, n: u64) bool {
+    val pushed: res[usize, allocator.Error] = vector.push[Sample](out, Sample{ns: ns, count: n});
+    ret sel pushed.ok;
+}
+
+# ret: false when a sample could not be kept
+fun run(b: *Bench, model: fun(*Bench) u64, out: *Vector[Sample]) bool {
+    val warm: Instant = now();
+    var i:    u64     = 0;
+    for (i < b.c.max_warmup_iters) {
+        val n: u64 = model(b);
+        if (since(warm) >= b.c.max_warmup_time) { brk; }
+        i = i + 1;
+    }
+    val start: Instant = now();
+    i = 0;
+    for (i < b.c.max_iters) {
+        val t:  Instant = now();
+        val n:  u64     = model(b);
+        val ns: i64     = since(t);
+        if (!push(out, ns, n))            { ret false; }
+        if (since(start) >= b.c.max_time) { brk; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# times compiling alone, then counts with what it compiled, untimed, to verify it
+fun compile(b: *Bench, out: *Vector[Sample]) bool {
+    val o:    regex.Options = options(b.c);
+    val warm: Instant       = now();
+    var i:    u64           = 0;
+    for (i < b.c.max_warmup_iters) {
+        var r: res[regex.Regex, regex.Error] = regex.compile_with(b.a, b.c.pattern, o);
+        if (sel r.err) { ret false; }
+        regex.dnit(?r.ok);
+        if (since(warm) >= b.c.max_warmup_time) { brk; }
+        i = i + 1;
+    }
+    val start: Instant = now();
+    i = 0;
+    for (i < b.c.max_iters) {
+        val t:  Instant                       = now();
+        var r:  res[regex.Regex, regex.Error] = regex.compile_with(b.a, b.c.pattern, o);
+        val ns: i64                           = since(t);
+        if (sel r.err) { ret false; }
+        var c: res[regex.Cache, regex.Error] = regex.cache(b.a, ?r.ok);
+        if (sel c.err) {
+            regex.dnit(?r.ok);
+            ret false;
+        }
+        var it: regex.Iter = regex.iter();
+        var n:  u64        = 0;
+        for {
+            val m: opt[regex.Match] = regex.next(?r.ok, ?c.ok, b.c.haystack, ?it);
+            if (sel m.none) { brk; }
+            n = n + 1;
+        }
+        regex.cache_dnit(?c.ok);
+        regex.dnit(?r.ok);
+        if (!push(out, ns, n))            { ret false; }
+        if (since(start) >= b.c.max_time) { brk; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun fail(message: str) i64 {
+    print.eprintln(message);
+    ret 1;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (argc == 2 && str_equals(argv[1], "version")) {
+        print.println("0.1.0");
+        ret 0;
+    }
+
+    var src: heap.Source;
+    var h:   heap.Heap;
+    var a:   allocator.Allocator;
+    heap.native_source(?src);
+    heap.init(?h, ?src, 0);
+    heap.make(?a, ?h);
+
+    var input: reader.Reader                     = filesystem.reader(filesystem.STDIN);
+    var raw:   res[Vector[u8], reader.ReadError] = reader.read_all(?a, ?input);
+    if (sel raw.err) { ret fail("failed to read the benchmark from stdin"); }
+    var c: Config;
+    if (!parse(view(raw.ok.data, raw.ok.len), ?c)) { ret fail("malformed KLV input"); }
+    if (c.patterns != 1)                           { ret fail("mach-regex runs one pattern per benchmark"); }
+
+    var out: Vector[Sample] = vector.init[Sample](?a);
+    var b:   Bench;
+    b.c = ?c;
+    b.a = ?a;
+    if (equals(c.model, "compile")) {
+        if (!compile(?b, ?out)) { ret fail("compile failed"); }
+    }
+    or {
+        val re: res[regex.Regex, regex.Error] = regex.compile_with(?a, c.pattern, options(?c));
+        if (sel re.err) {
+            print.eprintlnf("failed to compile: {}", regex.error_text(re.err));
+            ret 1;
+        }
+        b.re = re.ok;
+        val cache: res[regex.Cache, regex.Error] = regex.cache(?a, ?b.re);
+        if (sel cache.err) { ret fail("failed to make a cache"); }
+        b.cache = cache.ok;
+        b.slots = vector.init[usize](?a);
+        val slots: usize                       = regex.slot_count(?b.re);
+        val grown: res[usize, allocator.Error] = vector.reserve[usize](?b.slots, slots);
+        if (sel grown.err) { ret fail("out of memory"); }
+
+        var model: fun(*Bench) u64 = nil;
+        if (equals(c.model, "count"))          { model = count; }
+        or (equals(c.model, "count-spans"))    { model = count_spans; }
+        or (equals(c.model, "count-captures")) { model = count_captures; }
+        or (equals(c.model, "grep"))           { model = grep; }
+        or (equals(c.model, "grep-captures"))  { model = grep_captures; }
+        or                                     { ret fail("unsupported model"); }
+        if (!run(?b, model, ?out))             { ret fail("out of memory"); }
+    }
+
+    var i: usize = 0;
+    for (i < out.len) {
+        print.printlnf("{},{}", out.data[i].ns, out.data[i].count);
+        i = i + 1;
+    }
+    ret 0;
+}

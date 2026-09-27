@@ -8,6 +8,7 @@
 # the split regex-syntax's Utf8Sequences makes.
 
 use A: std.allocator;
+use std.allocator.testing;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use std.types.bool.bool;
@@ -15,6 +16,8 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
 
 # a sequence of byte ranges, one per encoded byte
 # ---
@@ -149,4 +152,41 @@ pub fun sequences(lo: u32, hi: u32, out: *Vector[Seq]) bool {
         }
     }
     ret true;
+}
+
+test utf8__sequences_of_every_code_point {
+    var t: testing.Testing;
+    testing.make(?t);
+    var seqs: Vector[Seq] = vector.init[Seq](testing.allocator_of(?t));
+    if (!sequences(0, 0x10FFFF, ?seqs)) { ret 1; }
+    # the canonical split, lo and hi bytes by position
+    val want: [9]str = [9]str{"00-7f", "c2-df 80-bf", "e0-e0 a0-bf 80-bf", "e1-ec 80-bf 80-bf", "ed-ed 80-9f 80-bf", "ee-ef 80-bf 80-bf", "f0-f0 90-bf 80-bf 80-bf", "f1-f3 80-bf 80-bf 80-bf", "f4-f4 80-8f 80-bf 80-bf"};
+    if (seqs.len != 9) { ret 2; }
+    val digits: str   = "0123456789abcdef";
+    var k:      usize = 0;
+    for (k < 9) {
+        var text: [32]u8;
+        var w:    usize = 0;
+        var d:    u32   = 0;
+        val s:    Seq   = seqs.data[k];
+        for (d < s.len) {
+            if (d > 0) {
+                text[w] = ' ';
+                w       = w + 1;
+            }
+            text[w]     = digits[s.lo[d] >> 4];
+            text[w + 1] = digits[s.lo[d] & 0xF];
+            text[w + 2] = '-';
+            text[w + 3] = digits[s.hi[d] >> 4];
+            text[w + 4] = digits[s.hi[d] & 0xF];
+            w           = w + 5;
+            d           = d + 1;
+        }
+        text[w] = 0;
+        if (!str_equals(?text[0], want[k])) { ret 3; }
+        k = k + 1;
+    }
+    vector.dnit[Seq](?seqs);
+    testing.dnit(?t);
+    ret 0;
 }

@@ -9,8 +9,7 @@
 # so the priority order within the loop stays right.
 
 use A: std.allocator;
-use std.collections.map;
-use std.collections.map.Map;
+use std.allocator.testing;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use std.types.bool.bool;
@@ -19,6 +18,10 @@ use std.types.bool.true;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.view;
 
 use prog: regex.compile.program;
 use regex.compile.program.Assert;
@@ -43,6 +46,15 @@ pub val MAX_INSTS: usize = 1048576;
 
 # a trie edge with no child state ends a sequence
 val LEAF: u32 = 0xFFFFFFFF;
+
+# a free slot in the range cache
+val EMPTY: u32 = 0xFFFFFFFF;
+
+# a byte ranked at least this common rules a set of more than three first bytes out
+val COMMON: u8 = 200;
+
+# a node whose utf-8 sequences are not yet known
+val NO_MEMO: u64 = 0xFFFFFFFFFFFFFFFF;
 
 # a state of a class's trie
 # ---
@@ -70,31 +82,41 @@ rec Edge {
 
 # the state of one compilation
 # ---
-# tree:   the Ast
-# prog:   the program being built
-# failed: an error was recorded
-# err:    the first error
-# set:    the code points of the class being compiled
-# part:   one member's code points
-# tmp:    scratch for negation
-# seqs:   the utf-8 sequences of the class
-# states: the trie's states
-# edges:  the trie's edges
-# cache:  one-range instructions by range and successor
-# null:   whether each node can match empty, 0 when not yet known, 1 no, 2 yes
+# tree:      the Ast
+# prog:      the program being built
+# reverse:   the program reads the text right to left
+# failed:    an error was recorded
+# err:       the first error
+# set:       the code points of the class being compiled
+# part:      one member's code points
+# tmp:       scratch for negation
+# seqs:      the utf-8 sequences of the class
+# states:    the trie's states
+# edges:     the trie's edges
+# keys:      the range cache's keys, a range and its successor, open addressed
+# vals:      the one-range instruction for each key, EMPTY for a free slot
+# filled:    keys in the range cache
+# memo:      each node's utf-8 sequences in memo_seqs, start and length, or NO_MEMO
+# memo_seqs: the utf-8 sequences of every class node compiled so far
+# null:      whether each node can match empty, 0 when not yet known, 1 no, 2 yes
 rec Compiler {
-    tree:   *syntax.Ast;
-    prog:   *Prog;
-    failed: bool;
-    err:    syntax.Error;
-    set:    Vector[Range];
-    part:   Vector[Range];
-    tmp:    Vector[Range];
-    seqs:   Vector[Seq];
-    states: Vector[State];
-    edges:  Vector[Edge];
-    cache:  Map[u64, u32];
-    null:   Vector[u8];
+    tree:      *syntax.Ast;
+    prog:      *Prog;
+    reverse:   bool;
+    failed:    bool;
+    err:       syntax.Error;
+    set:       Vector[Range];
+    part:      Vector[Range];
+    tmp:       Vector[Range];
+    seqs:      Vector[Seq];
+    states:    Vector[State];
+    edges:     Vector[Edge];
+    keys:      Vector[u64];
+    vals:      Vector[u32];
+    filled:    usize;
+    memo:      Vector[u64];
+    memo_seqs: Vector[Seq];
+    null:      Vector[u8];
 }
 
 # compile an Ast to a program
@@ -103,18 +125,40 @@ rec Compiler {
 # tree: the Ast, whose unicode class names are resolved here
 # ret:  the program, or the first error
 pub fun compile(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
+    ret generate(a, tree, false);
+}
+
+# compile an Ast to a program that reads the text right to left
+#
+# it accepts a text reversed exactly when the forward program accepts the text,
+# so run backward from where a match ends, it finds where the match can begin.
+# it records no captures and has no prefix.
+# ---
+# a:    the allocator the program grows in
+# tree: the Ast, whose unicode class names are resolved here
+# ret:  the program, or the first error
+pub fun reverse(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
+    ret generate(a, tree, true);
+}
+
+fun generate(a: *A.Allocator, tree: *syntax.Ast, backward: bool) res[Prog, syntax.Error] {
     var p: Prog     = prog.init(a);
     var c: Compiler = Compiler{
-        tree:   tree,
-        prog:   ?p,
-        set:    vector.init[Range](a),
-        part:   vector.init[Range](a),
-        tmp:    vector.init[Range](a),
-        seqs:   vector.init[Seq](a),
-        states: vector.init[State](a),
-        edges:  vector.init[Edge](a),
-        cache:  map.init[u64, u32](a),
-        null:   vector.init[u8](a),
+        tree:      tree,
+        prog:      ?p,
+        reverse:   backward,
+        set:       vector.init[Range](a),
+        part:      vector.init[Range](a),
+        tmp:       vector.init[Range](a),
+        seqs:      vector.init[Seq](a),
+        states:    vector.init[State](a),
+        edges:     vector.init[Edge](a),
+        keys:      vector.init[u64](a),
+        vals:      vector.init[u32](a),
+        filled:    0,
+        memo:      vector.init[u64](a),
+        memo_seqs: vector.init[Seq](a),
+        null:      vector.init[u8](a),
     };
     fin {
         vector.dnit[Range](?c.set);
@@ -123,25 +167,40 @@ pub fun compile(a: *A.Allocator, tree: *syntax.Ast) res[Prog, syntax.Error] {
         vector.dnit[Seq](?c.seqs);
         vector.dnit[State](?c.states);
         vector.dnit[Edge](?c.edges);
-        map.dnit[u64, u32](?c.cache);
+        vector.dnit[u64](?c.keys);
+        vector.dnit[u32](?c.vals);
+        vector.dnit[u64](?c.memo);
+        vector.dnit[Seq](?c.memo_seqs);
         vector.dnit[u8](?c.null);
     }
 
+    if (!slots(?c, 256)) { fail(?c, Kind.memory{}, 0); }
     var k: usize = 0;
     for (k < tree.nodes.len) {
+        val memo:   res[usize, A.Error] = vector.push[u64](?c.memo, NO_MEMO);
         val pushed: res[usize, A.Error] = vector.push[u8](?c.null, 0);
-        if (sel pushed.err) {
+        if (sel pushed.err || sel memo.err) {
             fail(?c, Kind.memory{}, 0);
             brk;
         }
         k = k + 1;
     }
     val done: u32 = emit(?c, Inst.match{});
-    val end:  u32 = emit(?c, Inst.save{Save{slot: 1, next: done}});
-    val body: u32 = node(?c, tree.root, end);
-    p.start = emit(?c, Inst.save{Save{slot: 0, next: body}});
-    p.slots = (tree.names.len * 2)::u32;
-    if (!c.failed) { prefix(?p); }
+    if (backward) {
+        p.start = node(?c, tree.root, done);
+    }
+    or {
+        val end:  u32 = emit(?c, Inst.save{Save{slot: 1, next: done}});
+        val body: u32 = node(?c, tree.root, end);
+        p.start = emit(?c, Inst.save{Save{slot: 0, next: body}});
+        p.slots = (tree.names.len * 2)::u32;
+        if (!c.failed) {
+            prefix(?p);
+            firsts(?c, a);
+            inner(?c);
+        }
+    }
+    if (!c.failed) { classify(?p); }
     if (c.failed) {
         prog.dnit(?p);
         ret res[Prog, syntax.Error].err{c.err};
@@ -171,6 +230,238 @@ fun prefix(p: *Prog) {
     }
 }
 
+# a class starts at lo and another just past hi
+fun cut(starts: *u8, lo: u8, hi: u8) {
+    starts[lo::usize]     = 1;
+    starts[hi::usize + 1] = 1;
+}
+
+# partition the bytes into the classes the program tells apart
+#
+# every transition's range bounds a class, and so do the newline, the utf-8
+# continuation bytes and, when the program asserts a word boundary, the ascii
+# word bytes, since a search decides line anchors, where new matches may start
+# and word boundaries by the byte's class alone.
+fun classify(p: *Prog) {
+    var starts: [257]u8;
+    var word:   bool  = false;
+    var k:      usize = 0;
+    for (k < p.insts.len) {
+        val i: Inst = p.insts.data[k];
+        if (sel i.range) {
+            cut(?starts[0], i.range.lo, i.range.hi);
+        }
+        or (sel i.look) {
+            if (sel i.look.assert.word_boundary || sel i.look.assert.not_word_boundary) { word = true; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < p.trans.len) {
+        cut(?starts[0], p.trans.data[k].lo, p.trans.data[k].hi);
+        k = k + 1;
+    }
+    cut(?starts[0], '\n', '\n');
+    cut(?starts[0], 0x80, 0xBF);
+    if (word) {
+        cut(?starts[0], '0', '9');
+        cut(?starts[0], 'A', 'Z');
+        cut(?starts[0], '_', '_');
+        cut(?starts[0], 'a', 'z');
+    }
+    var n: u32 = 0;
+    k = 0;
+    for (k < 256) {
+        if (k > 0 && starts[k] != 0) { n = n + 1; }
+        p.classes[k] = n::u8;
+        k            = k + 1;
+    }
+    p.class_count = n + 1;
+}
+
+# the bytes every match begins with one of, when there are at most sixteen
+#
+# they are the ranges reached from the start through saves and choices alone.
+# an assertion or a match before any byte, or a seventeenth byte, leaves none,
+# since then a search cannot skip to the next of them.
+fun firsts(c: *Compiler, a: *A.Allocator) {
+    val p:       *Prog       = c.prog;
+    var visited: Vector[u8]  = vector.init[u8](a);
+    var stack:   Vector[u32] = vector.init[u32](a);
+    fin {
+        vector.dnit[u8](?visited);
+        vector.dnit[u32](?stack);
+    }
+    p.first_count = 0;
+    val grown: res[usize, A.Error] = vector.ensure[u8](?visited, p.insts.len);
+    val room:  res[usize, A.Error] = vector.push[u32](?stack, p.start);
+    if (sel grown.err || sel room.err) {
+        fail(c, Kind.memory{}, 0);
+        ret;
+    }
+    var k: usize = 0;
+    for (k < p.insts.len) {
+        visited.data[k] = 0;
+        k               = k + 1;
+    }
+    visited.len = p.insts.len;
+    var bytes: [256]u8;
+    var count: u32 = 0;
+    for (stack.len > 0) {
+        stack.len = stack.len - 1;
+        val pc: u32 = stack.data[stack.len];
+        if (visited.data[pc] != 0) { cnt; }
+        visited.data[pc] = 1;
+        val i:    Inst  = p.insts.data[pc];
+        var next: [2]u32;
+        var more: usize = 0;
+        if (sel i.split) {
+            next[0] = i.split.x;
+            next[1] = i.split.y;
+            more    = 2;
+        }
+        or (sel i.save) {
+            next[0] = i.save.next;
+            more    = 1;
+        }
+        or (sel i.range) {
+            count = add_firsts(?bytes[0], count, i.range.lo, i.range.hi);
+        }
+        or (sel i.sparse) {
+            var t: u32 = 0;
+            for (t < i.sparse.len) {
+                val tr: Trans = p.trans.data[i.sparse.start + t];
+                count = add_firsts(?bytes[0], count, tr.lo, tr.hi);
+                t     = t + 1;
+            }
+        }
+        or (sel i.look || sel i.match) {
+            ret;
+        }
+        if (count > prog.MAX_FIRSTS) { ret; }
+        var m: usize = 0;
+        for (m < more) {
+            val pushed: res[usize, A.Error] = vector.push[u32](?stack, next[m]);
+            if (sel pushed.err) {
+                fail(c, Kind.memory{}, 0);
+                ret;
+            }
+            m = m + 1;
+        }
+    }
+    if (count == 0) { ret; }
+    # a larger set is worth scanning for only when all of it is uncommon, as
+    # capitals beginning an alternation of names are and lowercase letters are not
+    if (count > 3) {
+        var k: usize = 0;
+        for (k < 256) {
+            if (bytes[k] != 0 && prog.RANK[k] >= COMMON) { ret; }
+            k = k + 1;
+        }
+    }
+    var n: u32   = 0;
+    var b: usize = 0;
+    for (b < 256) {
+        if (bytes[b] != 0) {
+            p.firsts[n] = b::u8;
+            n           = n + 1;
+        }
+        b = b + 1;
+    }
+    p.first_count = count;
+}
+
+# mark the bytes of a range among the first bytes, giving the new count, which
+# stops mattering once it passes sixteen
+fun add_firsts(bytes: *u8, count: u32, lo: u8, hi: u8) u32 {
+    var n: u32   = count;
+    var b: usize = lo::usize;
+    for (b <= hi::usize && n <= prog.MAX_FIRSTS) {
+        if (bytes[b] == 0) {
+            bytes[b] = 1;
+            n        = n + 1;
+        }
+        b = b + 1;
+    }
+    ret n;
+}
+
+# a literal every match contains, when neither a prefix nor first bytes let a
+# search skip and no match can span a newline
+#
+# it is the longest run of plain literals in the pattern's top concatenation,
+# cut to sixteen bytes. a search then skips to the line of its next occurrence,
+# since every match lies within one line and contains it.
+fun inner(c: *Compiler) {
+    val p: *Prog = c.prog;
+    p.inner_len = 0;
+    if (p.prefix_len > 0 || p.first_count > 0) { ret; }
+    # no byte a match reads may be a newline
+    var k: usize = 0;
+    for (k < p.insts.len) {
+        val i: Inst = p.insts.data[k];
+        if (sel i.range) {
+            if (i.range.lo <= '\n' && i.range.hi >= '\n') { ret; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < p.trans.len) {
+        if (p.trans.data[k].lo <= '\n' && p.trans.data[k].hi >= '\n') { ret; }
+        k = k + 1;
+    }
+    var root: usize = c.tree.root;
+    for {
+        val n: Node = c.tree.nodes.data[root];
+        if (sel n.capture) {
+            root = n.capture.sub;
+            cnt;
+        }
+        brk;
+    }
+    val top: Node = c.tree.nodes.data[root];
+    if (!(sel top.concat)) { ret; }
+    var run:  [16]u8;
+    var len:  u32 = 0;
+    var best: u32 = 0;
+    k = 0;
+    for (k <= top.concat.len) {
+        var plain: bool = false;
+        var cp:    u32  = 0;
+        if (k < top.concat.len) {
+            val n: Node = c.tree.nodes.data[c.tree.kids.data[top.concat.start + k]];
+            if (sel n.literal) {
+                plain = !n.literal.fold;
+                cp    = n.literal.cp;
+            }
+        }
+        if (plain) {
+            var bytes: [4]u8;
+            val count: u32 = utf8.encode(cp, ?bytes[0]);
+            var b:     u32 = 0;
+            for (b < count && len < 16) {
+                run[len] = bytes[b];
+                len      = len + 1;
+                b        = b + 1;
+            }
+        }
+        or {
+            # a run ends here, and the longest so far is kept
+            if (len > best) {
+                var b: u32 = 0;
+                for (b < len) {
+                    p.inner[b] = run[b];
+                    b          = b + 1;
+                }
+                best = len;
+            }
+            len = 0;
+        }
+        k = k + 1;
+    }
+    p.inner_len = best;
+}
+
 fun fail(c: *Compiler, kind: Kind, offset: usize) {
     if (c.failed) { ret; }
     c.failed = true;
@@ -192,16 +483,72 @@ fun emit(c: *Compiler, i: Inst) u32 {
     ret (c.prog.insts.len - 1)::u32;
 }
 
+# size the range cache to n free slots, n a power of two
+fun slots(c: *Compiler, n: usize) bool {
+    val keys: res[usize, A.Error] = vector.ensure[u64](?c.keys, n);
+    val vals: res[usize, A.Error] = vector.ensure[u32](?c.vals, n);
+    if (sel keys.err || sel vals.err) { ret false; }
+    c.keys.len = n;
+    c.vals.len = n;
+    var k: usize = 0;
+    for (k < n) {
+        c.vals.data[k] = EMPTY;
+        k              = k + 1;
+    }
+    ret true;
+}
+
+# where a key sits in the range cache, or the free slot it would take
+fun slot(c: *Compiler, key: u64) usize {
+    val mask: usize = c.keys.len - 1;
+    var at:   usize = ((key * 0x9E3779B97F4A7C15) >> 32)::usize & mask;
+    for (c.vals.data[at] != EMPTY && c.keys.data[at] != key) { at = (at + 1) & mask; }
+    ret at;
+}
+
+# double the range cache, placing every key again
+fun grow(c: *Compiler) bool {
+    val n:    usize       = c.keys.len;
+    var keys: Vector[u64] = c.keys;
+    var vals: Vector[u32] = c.vals;
+    c.keys = vector.init[u64](keys.a);
+    c.vals = vector.init[u32](vals.a);
+    val ok: bool = slots(c, n * 2);
+    if (ok) {
+        var k: usize = 0;
+        for (k < n) {
+            if (vals.data[k] != EMPTY) {
+                val at: usize = slot(c, keys.data[k]);
+                c.keys.data[at] = keys.data[k];
+                c.vals.data[at] = vals.data[k];
+            }
+            k = k + 1;
+        }
+    }
+    vector.dnit[u64](?keys);
+    vector.dnit[u32](?vals);
+    ret ok;
+}
+
 # a one-range instruction, shared with any identical one already emitted
 fun range(c: *Compiler, lo: u8, hi: u8, next: u32) u32 {
-    val key: u64       = (lo::u64 << 40) | (hi::u64 << 32) | next::u64;
-    val hit: opt[*u32] = map.get[u64, u32](?c.cache, ?key);
-    if (sel hit.some) { ret @hit.some; }
-    val at: u32 = emit(c, Inst.range{Trans{lo: lo, hi: hi, next: next}});
+    val key: u64   = (lo::u64 << 40) | (hi::u64 << 32) | next::u64;
+    var at:  usize = slot(c, key);
+    if (c.vals.data[at] != EMPTY) { ret c.vals.data[at]; }
+    val inst: u32 = emit(c, Inst.range{Trans{lo: lo, hi: hi, next: next}});
     if (c.failed) { ret 0; }
-    val stored: res[bool, A.Error] = map.insert[u64, u32](?c.cache, key, at);
-    if (sel stored.err) { fail(c, Kind.memory{}, 0); }
-    ret at;
+    # at most half full, so a probe always ends at a free slot
+    if ((c.filled + 1) * 2 > c.keys.len) {
+        if (!grow(c)) {
+            fail(c, Kind.memory{}, 0);
+            ret 0;
+        }
+        at = slot(c, key);
+    }
+    c.keys.data[at] = key;
+    c.vals.data[at] = inst;
+    c.filled        = c.filled + 1;
+    ret inst;
 }
 
 # whether a node can match the empty string
@@ -242,18 +589,16 @@ fun nullable(c: *Compiler, i: usize) bool {
 fun node(c: *Compiler, i: usize, next: u32) u32 {
     if (c.failed) { ret 0; }
     val n: Node = c.tree.nodes.data[i];
-    if (sel n.empty)   { ret next; }
-    if (sel n.literal) { ret literal(c, n.literal.cp, n.literal.fold, next); }
-    if (sel n.class)   { ret class(c, c.tree.classes.data[n.class], next); }
-    if (sel n.any) {
-        c.set.len = 0;
-        if (!ranges.append(?c.set, 0, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
-        ret set(c, next);
+    if (sel n.empty) { ret next; }
+    if (sel n.literal) {
+        if (!n.literal.fold) { ret literal(c, n.literal.cp, false, next); }
     }
-    if (sel n.any_but_newline) {
-        c.set.len = 0;
-        if (!ranges.append(?c.set, 0, 9) || !ranges.append(?c.set, 11, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
-        ret set(c, next);
+    # a class repeated, as in x{0,100}, compiles its code points once
+    if (sel n.literal || sel n.class || sel n.any || sel n.any_but_newline) {
+        if (recall(c, i)) { ret automaton(c, next); }
+        val at: u32 = code_points(c, n, next);
+        keep(c, i);
+        ret at;
     }
     if (sel n.begin_line)        { ret look(c, Assert.begin_line{}, next); }
     if (sel n.end_line)          { ret look(c, Assert.end_line{}, next); }
@@ -262,6 +607,7 @@ fun node(c: *Compiler, i: usize, next: u32) u32 {
     if (sel n.word_boundary)     { ret look(c, Assert.word_boundary{}, next); }
     if (sel n.not_word_boundary) { ret look(c, Assert.not_word_boundary{}, next); }
     if (sel n.capture) {
+        if (c.reverse) { ret node(c, n.capture.sub, next); }
         val slot: u32 = n.capture.index * 2;
         val end:  u32 = emit(c, Inst.save{Save{slot: slot + 1, next: next}});
         val body: u32 = node(c, n.capture.sub, end);
@@ -269,8 +615,17 @@ fun node(c: *Compiler, i: usize, next: u32) u32 {
     }
     if (sel n.repeat) { ret repeat(c, n.repeat, next); }
     if (sel n.concat) {
-        var at: u32   = next;
-        var k:  usize = n.concat.len;
+        var at: u32 = next;
+        # read backward, the first part is read last, so it is compiled first
+        if (c.reverse) {
+            var k: usize = 0;
+            for (k < n.concat.len) {
+                at = node(c, c.tree.kids.data[n.concat.start + k], at);
+                k  = k + 1;
+            }
+            ret at;
+        }
+        var k: usize = n.concat.len;
         for (k > 0) {
             k  = k - 1;
             at = node(c, c.tree.kids.data[n.concat.start + k], at);
@@ -289,6 +644,55 @@ fun node(c: *Compiler, i: usize, next: u32) u32 {
         ret at;
     }
     ret next;
+}
+
+# compile a folded literal, a class or a dot, gathering its code points
+fun code_points(c: *Compiler, n: Node, next: u32) u32 {
+    if (sel n.literal) { ret literal(c, n.literal.cp, n.literal.fold, next); }
+    if (sel n.class)   { ret class(c, c.tree.classes.data[n.class], next); }
+    c.set.len = 0;
+    if (sel n.any) {
+        if (!ranges.append(?c.set, 0, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
+    }
+    or {
+        if (!ranges.append(?c.set, 0, 9) || !ranges.append(?c.set, 11, ranges.MAX_CP)) { fail(c, Kind.memory{}, 0); }
+    }
+    ret set(c, next);
+}
+
+# put a node's utf-8 sequences, kept when it was first compiled, in c.seqs
+fun recall(c: *Compiler, i: usize) bool {
+    val m: u64 = c.memo.data[i];
+    if (m == NO_MEMO) { ret false; }
+    val start: usize = (m >> 32)::usize;
+    val len:   usize = (m & 0xFFFFFFFF)::usize;
+    c.seqs.len = 0;
+    var k: usize = 0;
+    for (k < len) {
+        val pushed: res[usize, A.Error] = vector.push[Seq](?c.seqs, c.memo_seqs.data[start + k]);
+        if (sel pushed.err) {
+            fail(c, Kind.memory{}, 0);
+            ret false;
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# keep the utf-8 sequences in c.seqs as a node's
+fun keep(c: *Compiler, i: usize) {
+    if (c.failed) { ret; }
+    val start: usize = c.memo_seqs.len;
+    var k:     usize = 0;
+    for (k < c.seqs.len) {
+        val pushed: res[usize, A.Error] = vector.push[Seq](?c.memo_seqs, c.seqs.data[k]);
+        if (sel pushed.err) {
+            fail(c, Kind.memory{}, 0);
+            ret;
+        }
+        k = k + 1;
+    }
+    c.memo.data[i] = (start::u64 << 32) | c.seqs.len::u64;
 }
 
 fun look(c: *Compiler, a: Assert, next: u32) u32 {
@@ -367,7 +771,15 @@ fun literal(c: *Compiler, cp: u32, fold: bool, next: u32) u32 {
     var bytes: [4]u8;
     val n:     u32 = utf8.encode(cp, ?bytes[0]);
     var at:    u32 = next;
-    var k:     u32 = n;
+    if (c.reverse) {
+        var k: u32 = 0;
+        for (k < n) {
+            at = range(c, bytes[k], bytes[k], at);
+            k  = k + 1;
+        }
+        ret at;
+    }
+    var k: u32 = n;
     for (k > 0) {
         k  = k - 1;
         at = range(c, bytes[k], bytes[k], at);
@@ -447,16 +859,49 @@ fun set(c: *Compiler, next: u32) u32 {
         }
         k = k + 1;
     }
+    ret automaton(c, next);
+}
+
+# compile the utf-8 sequences in c.seqs to their automaton
+fun automaton(c: *Compiler, next: u32) u32 {
+    if (c.failed)        { ret 0; }
     if (c.seqs.len == 0) { ret emit(c, Inst.fail{}); }
+    if (c.reverse)       { ret backward(c, next); }
     c.states.len = 0;
     c.edges.len  = 0;
     if (!state(c)) { ret 0; }
-    k = 0;
+    var k: usize = 0;
     for (k < c.seqs.len) {
         if (!insert(c, c.seqs.data[k])) { ret 0; }
         k = k + 1;
     }
     ret build(c, 0, next);
+}
+
+# the sequences in c.seqs read backward, each a chain of ranges ending at its
+# lead byte, joined by splits
+#
+# reversed, the sequences no longer arrive in byte order and their first ranges
+# overlap, so they cannot share a trie. chains with the same tail share it
+# through the range cache.
+fun backward(c: *Compiler, next: u32) u32 {
+    var at: u32   = chain(c, c.seqs.data[c.seqs.len - 1], next);
+    var k:  usize = c.seqs.len - 1;
+    for (k > 0) {
+        k  = k - 1;
+        at = emit(c, Inst.split{Split{x: chain(c, c.seqs.data[k], next), y: at}});
+    }
+    ret at;
+}
+
+fun chain(c: *Compiler, s: Seq, next: u32) u32 {
+    var at: u32 = next;
+    var d:  u32 = 0;
+    for (d < s.len) {
+        at = range(c, s.lo[d], s.hi[d], at);
+        d  = d + 1;
+    }
+    ret at;
 }
 
 # a new empty trie state, giving false when the allocator refuses
@@ -533,4 +978,333 @@ fun build(c: *Compiler, at: u32, next: u32) u32 {
         e = c.edges.data[e].sib;
     }
     ret emit(c, Inst.sparse{Sparse{start: start, len: count}});
+}
+
+# whether a byte is an ascii word byte
+#[testing]
+fun word(b: u8) bool {
+    ret (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_';
+}
+
+#[testing]
+fun holds(a: Assert, s: *u8, n: usize, pos: usize) bool {
+    if (sel a.begin_text) { ret pos == 0; }
+    if (sel a.end_text)   { ret pos == n; }
+    if (sel a.begin_line) { ret pos == 0 || s[pos - 1] == '\n'; }
+    if (sel a.end_line)   { ret pos == n || s[pos] == '\n'; }
+    val before: bool = pos > 0 && word(s[pos - 1]);
+    val after:  bool = pos < n && word(s[pos]);
+    if (sel a.word_boundary) { ret before != after; }
+    ret before == after;
+}
+
+# a small reference interpreter runs a program over a byte string as a whole
+# match, memoizing each instruction and position it has tried, so every test
+# asks which texts a pattern's program accepts rather than how it is built.
+#[testing]
+fun run(p: *Prog, pc: u32, s: *u8, n: usize, pos: usize, seen: *u8) bool {
+    val key: usize = pc::usize * (n + 1) + pos;
+    if (seen[key] != 0) { ret false; }
+    seen[key] = 1;
+    val i: Inst = p.insts.data[pc];
+    if (sel i.match) { ret pos == n; }
+    if (sel i.range) { ret pos < n && s[pos] >= i.range.lo && s[pos] <= i.range.hi && run(p, i.range.next, s, n, pos + 1, seen); }
+    if (sel i.sparse) {
+        if (pos >= n) { ret false; }
+        var k: u32 = 0;
+        for (k < i.sparse.len) {
+            val t: Trans = p.trans.data[i.sparse.start + k];
+            if (s[pos] >= t.lo && s[pos] <= t.hi) { ret run(p, t.next, s, n, pos + 1, seen); }
+            k = k + 1;
+        }
+        ret false;
+    }
+    if (sel i.split) { ret run(p, i.split.x, s, n, pos, seen) || run(p, i.split.y, s, n, pos, seen); }
+    if (sel i.save)  { ret run(p, i.save.next, s, n, pos, seen); }
+    if (sel i.look)  { ret holds(i.look.assert, s, n, pos) && run(p, i.look.next, s, n, pos, seen); }
+    ret false;
+}
+
+# a pattern compiled with the testing allocator, cleaned up by close
+rec Compiled {
+    t:    testing.Testing;
+    tree: syntax.Ast;
+    prog: Prog;
+    ok:   bool;
+}
+
+#[testing]
+fun open(c: *Compiled, pattern: str) {
+    open_as(c, pattern, false);
+}
+
+#[testing]
+fun open_as(c: *Compiled, pattern: str, backward: bool) {
+    testing.make(?c.t);
+    val a:     *A.Allocator                  = testing.allocator_of(?c.t);
+    var flags: syntax.Flags;
+    val tree:  res[syntax.Ast, syntax.Error] = syntax.parse(a, view(pattern, str_len(pattern)), flags, false);
+    c.ok = false;
+    if (sel tree.err) { ret; }
+    c.tree = tree.ok;
+    val p: res[Prog, syntax.Error] = generate(a, ?c.tree, backward);
+    if (sel p.err) {
+        syntax.dnit(?c.tree);
+        ret;
+    }
+    c.prog = p.ok;
+    c.ok   = true;
+}
+
+#[testing]
+fun close(c: *Compiled) bool {
+    if (c.ok) {
+        prog.dnit(?c.prog);
+        syntax.dnit(?c.tree);
+    }
+    val clean: bool = !testing.leaked(?c.t);
+    testing.dnit(?c.t);
+    ret clean;
+}
+
+# whether the program accepts exactly the text given as n bytes
+#[testing]
+fun accepts(c: *Compiled, s: *u8, n: usize) bool {
+    var seen: [8192]u8;
+    var k:    usize = 0;
+    for (k < 8192) {
+        seen[k] = 0;
+        k       = k + 1;
+    }
+    if (prog.size(?c.prog) * (n + 1) > 8192) { ret false; }
+    ret run(?c.prog, c.prog.start, s, n, 0, ?seen[0]);
+}
+
+#[testing]
+fun takes(c: *Compiled, s: str) bool {
+    ret accepts(c, s, str_len(s));
+}
+
+# whether the program accepts the text read backward
+#[testing]
+fun takes_backward(c: *Compiled, s: str) bool {
+    var b: [64]u8;
+    val n: usize = str_len(s);
+    var k: usize = 0;
+    for (k < n) {
+        b[k] = s[n - 1 - k];
+        k    = k + 1;
+    }
+    ret accepts(c, ?b[0], n);
+}
+
+# whether the program accepts a code point's encoding
+#[testing]
+fun takes_cp(c: *Compiled, cp: u32) bool {
+    var b: [4]u8;
+    val n: u32 = utf8.encode(cp, ?b[0]);
+    ret accepts(c, ?b[0], n::usize);
+}
+
+test compile__classes_accept_exactly_their_members {
+    var c: Compiled;
+    open(?c, "\\p{Greek}");
+    if (!c.ok || !takes_cp(?c, 0x3B1) || !takes_cp(?c, 0x3A9) || takes_cp(?c, 'a')) { ret 1; }
+    if (!close(?c))                                                                 { ret 2; }
+    open(?c, "[^a-z]");
+    if (!c.ok || !takes(?c, "A") || takes(?c, "q") || !takes_cp(?c, 0x1F600) || takes(?c, "\xFF")) { ret 3; }
+    if (!close(?c))                                                                                { ret 4; }
+    open(?c, "(?i)k");
+    if (!c.ok || !takes(?c, "k") || !takes(?c, "K") || !takes_cp(?c, 0x212A) || takes(?c, "x")) { ret 5; }
+    if (!close(?c))                                                                             { ret 6; }
+    # a negated member folds before it negates, so no variant of k is outside \w
+    open(?c, "(?i)\\W");
+    if (!c.ok || takes(?c, "k") || takes(?c, "K") || takes_cp(?c, 0x212A) || !takes(?c, "-")) { ret 7; }
+    if (!close(?c))                                                                           { ret 8; }
+    open(?c, ".");
+    if (!c.ok || takes(?c, "\n") || !takes_cp(?c, 0x10FFFF) || takes(?c, "\xED\xA0\x80")) { ret 9; }
+    if (!close(?c))                                                                       { ret 10; }
+    open(?c, "(?s).");
+    if (!c.ok || !takes(?c, "\n")) { ret 11; }
+    if (!close(?c))                { ret 12; }
+    open(?c, "[^\\x00-\\x{10FFFF}]");
+    if (!c.ok || takes(?c, "a") || takes(?c, "")) { ret 13; }
+    if (!close(?c))                               { ret 14; }
+    ret 0;
+}
+
+test compile__repetition_captures_and_anchors {
+    var c: Compiled;
+    open(?c, "a{2,3}");
+    if (!c.ok || takes(?c, "a") || !takes(?c, "aa") || !takes(?c, "aaa") || takes(?c, "aaaa")) { ret 1; }
+    if (!close(?c))                                                                            { ret 2; }
+    open(?c, "(a|bc)+d?");
+    if (!c.ok || !takes(?c, "abca") || !takes(?c, "bcd") || takes(?c, "d") || takes(?c, "ab")) { ret 3; }
+    if (!close(?c))                                                                            { ret 4; }
+    open(?c, "(a*)*b");
+    if (!c.ok || !takes(?c, "b") || !takes(?c, "aaab") || takes(?c, "aaa")) { ret 5; }
+    if (!close(?c))                                                         { ret 6; }
+    open(?c, "x{2,}");
+    if (!c.ok || takes(?c, "x") || !takes(?c, "xx") || !takes(?c, "xxxxx")) { ret 7; }
+    if (!close(?c))                                                         { ret 8; }
+    open(?c, "(?m)^a$\\n^\\bb\\B");
+    if (!c.ok || c.prog.slots != 2) { ret 9; }
+    if (!close(?c))                 { ret 10; }
+    open(?c, "(a)(?P<n>b)");
+    if (!c.ok || c.prog.slots != 6 || !takes(?c, "ab")) { ret 11; }
+    if (!close(?c))                                     { ret 12; }
+    ret 0;
+}
+
+# every code point takes 11 instructions, \p{Greek} 26 and \pL 313, as built today
+test compile__sizes_stay_small {
+    var c: Compiled;
+    open(?c, "[\\x00-\\x{10FFFF}]");
+    if (!c.ok || prog.size(?c.prog) > 16) { ret 1; }
+    if (!close(?c))                       { ret 2; }
+    open(?c, "\\p{Greek}");
+    if (!c.ok || prog.size(?c.prog) > 40) { ret 3; }
+    if (!close(?c))                       { ret 4; }
+    open(?c, "\\pL");
+    if (!c.ok || prog.size(?c.prog) > 400) { ret 5; }
+    if (!close(?c))                        { ret 6; }
+    ret 0;
+}
+
+test compile__errors {
+    var t: testing.Testing;
+    testing.make(?t);
+    val a:     *A.Allocator                  = testing.allocator_of(?t);
+    var flags: syntax.Flags;
+    var tree:  res[syntax.Ast, syntax.Error] = syntax.parse(a, view("a\\p{Nope}", 9), flags, false);
+    if (sel tree.err) { ret 1; }
+    val bad: res[Prog, syntax.Error] = compile(a, ?tree.ok);
+    if (sel bad.ok)                                                                                     { ret 2; }
+    if (!str_equals(syntax.text(bad.err.kind), "invalid character class range") || bad.err.offset != 1) { ret 3; }
+    syntax.dnit(?tree.ok);
+    var big: res[syntax.Ast, syntax.Error] = syntax.parse(a, view("(\\pL{1000}){1000}", 17), flags, false);
+    if (sel big.err) { ret 4; }
+    val large: res[Prog, syntax.Error] = compile(a, ?big.ok);
+    if (sel large.ok)                                                     { ret 5; }
+    if (!str_equals(syntax.text(large.err.kind), "expression too large")) { ret 6; }
+    syntax.dnit(?big.ok);
+    if (testing.leaked(?t)) { ret 7; }
+    testing.dnit(?t);
+    ret 0;
+}
+
+# every allocation the compiler makes can fail, and each failure frees what it took
+test compile__allocation_failures {
+    # the parse draws on its own allocator, so each ordinal counts only the compiler's allocations
+    var parsed: testing.Testing;
+    testing.make(?parsed);
+    var flags: syntax.Flags;
+    var tree:  res[syntax.Ast, syntax.Error] = syntax.parse(testing.allocator_of(?parsed), view("(?i)(a|[b-d\\p{Greek}])*x{2}", 26), flags, false);
+    if (sel tree.err) { ret 1; }
+    var n: usize = 1;
+    for (n < 400) {
+        var t: testing.Testing;
+        testing.make(?t);
+        testing.fail_at_ordinal(?t, n);
+        val got: res[Prog, syntax.Error] = compile(testing.allocator_of(?t), ?tree.ok);
+        if (sel got.ok) {
+            var p: Prog = got.ok;
+            prog.dnit(?p);
+            val leaked: bool = testing.leaked(?t);
+            testing.dnit(?t);
+            syntax.dnit(?tree.ok);
+            testing.dnit(?parsed);
+            if (leaked) { ret 2; }
+            ret 0;
+        }
+        if (testing.leaked(?t)) { ret 3; }
+        testing.dnit(?t);
+        n = n + 1;
+    }
+    ret 4;
+}
+
+test compile__byte_classes {
+    var c: Compiled;
+    open(?c, "a");
+    # 0-9, the newline, 11-96, a, b-127, the continuation bytes and 192-255
+    if (!c.ok || c.prog.class_count != 7)                                                             { ret 1; }
+    if (c.prog.classes['a'] == c.prog.classes['b'] || c.prog.classes['b'] != c.prog.classes['z'])     { ret 2; }
+    if (c.prog.classes[0x80] != c.prog.classes[0xBF] || c.prog.classes[0xBF] == c.prog.classes[0xC0]) { ret 3; }
+    if (!close(?c))                                                                                   { ret 4; }
+    open(?c, "\\bx");
+    # a word boundary also sets the ascii word bytes apart
+    if (!c.ok || c.prog.classes['_'] == c.prog.classes['^'] || c.prog.classes['0'] == c.prog.classes['/']) { ret 5; }
+    if (!close(?c))                                                                                        { ret 6; }
+    ret 0;
+}
+
+test reverse__accepts_the_text_backward {
+    var c: Compiled;
+    open_as(?c, "abc", true);
+    if (!c.ok || !takes_backward(?c, "abc") || takes(?c, "abc") || c.prog.slots != 0) { ret 1; }
+    if (!close(?c))                                                                   { ret 2; }
+    open_as(?c, "a(b|cd)*e", true);
+    if (!c.ok || !takes_backward(?c, "acdbe") || !takes_backward(?c, "ae") || takes_backward(?c, "ace")) { ret 3; }
+    if (!close(?c))                                                                                      { ret 4; }
+    # classes and folded literals read their utf-8 backward too
+    open_as(?c, "\\p{Greek}[a-c]\xc3\xa9(?i)k", true);
+    if (!c.ok || !takes_backward(?c, "\xce\xb1b\xc3\xa9\xe2\x84\xaa") || !takes_backward(?c, "\xcf\x89a\xc3\xa9K")) { ret 5; }
+    if (takes_backward(?c, "\xce\xb1d\xc3\xa9k") || takes(?c, "\xce\xb1b\xc3\xa9k"))                                { ret 6; }
+    if (!close(?c))                                                                                                 { ret 7; }
+    ret 0;
+}
+
+test compile__first_bytes {
+    var c: Compiled;
+    # s folds to S and to the long s, whose utf-8 begins with 0xc5
+    open(?c, "(?i)sherlock");
+    if (!c.ok || c.prog.first_count != 3 || c.prog.firsts[0] != 'S' || c.prog.firsts[1] != 's' || c.prog.firsts[2] != 0xC5) { ret 1; }
+    if (!close(?c))                                                                                                         { ret 2; }
+    open(?c, "a|bc|c");
+    if (!c.ok || c.prog.first_count != 3) { ret 3; }
+    if (!close(?c))                       { ret 4; }
+    # an alternation of literals keeps each first byte once, in byte order
+    open(?c, "Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty");
+    if (!c.ok || c.prog.first_count != 4 || c.prog.firsts[0] != 'I' || c.prog.firsts[1] != 'J' || c.prog.firsts[2] != 'P' || c.prog.firsts[3] != 'S') { ret 5; }
+    if (!close(?c))                                                                                                                                   { ret 6; }
+    open(?c, "A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P");
+    if (!c.ok || c.prog.first_count != 16 || c.prog.firsts[15] != 'P') { ret 7; }
+    if (!close(?c))                                                    { ret 8; }
+    # a seventeenth byte, more than three common bytes, an assertion first, or a
+    # match without a byte leave none
+    open(?c, "a|b|c|d");
+    if (!c.ok || c.prog.first_count != 0) { ret 15; }
+    if (!close(?c))                       { ret 16; }
+    open(?c, "A|B|C|D|E|F|G|H|I|J|K|L|M|N|O|P|Q");
+    if (!c.ok || c.prog.first_count != 0) { ret 9; }
+    if (!close(?c))                       { ret 10; }
+    open(?c, "\\ba");
+    if (!c.ok || c.prog.first_count != 0) { ret 11; }
+    if (!close(?c))                       { ret 12; }
+    open(?c, "x*");
+    if (!c.ok || c.prog.first_count != 0) { ret 13; }
+    if (!close(?c))                       { ret 14; }
+    ret 0;
+}
+
+test compile__inner_literal {
+    var c: Compiled;
+    open(?c, ".*.*=.*");
+    if (!c.ok || c.prog.inner_len != 1 || c.prog.inner[0] != '=') { ret 1; }
+    if (!close(?c))                                               { ret 2; }
+    open(?c, "\\w+@example\\.com");
+    if (!c.ok || c.prog.inner_len != 12 || c.prog.inner[0] != '@' || c.prog.inner[11] != 'm') { ret 3; }
+    if (!close(?c))                                                                           { ret 4; }
+    # a match that can span a newline, an alternation at the top, or a prefix leave none
+    open(?c, "\\s+=");
+    if (!c.ok || c.prog.inner_len != 0) { ret 5; }
+    if (!close(?c))                     { ret 6; }
+    open(?c, ".*=|x");
+    if (!c.ok || c.prog.inner_len != 0) { ret 7; }
+    if (!close(?c))                     { ret 8; }
+    open(?c, "ab.*=");
+    if (!c.ok || c.prog.inner_len != 0 || c.prog.prefix_len != 2) { ret 9; }
+    if (!close(?c))                                               { ret 10; }
+    ret 0;
 }

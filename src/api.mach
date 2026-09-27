@@ -6,8 +6,11 @@
 # was made for. positions are byte offsets into the text, which is utf-8.
 
 use A: std.allocator;
+use std.allocator.heap;
+use std.allocator.testing;
 use std.collections.vector;
 use std.collections.vector.Vector;
+use std.print;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -15,11 +18,15 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.view.View;
 use std.types.view.view;
 
 use program: regex.compile;
 use regex.compile.Prog;
+use regex.exec.backtrack;
+use regex.exec.dfa;
+use regex.exec.onepass;
 use regex.exec.pikevm;
 use regex.syntax;
 use regex.syntax.Error;
@@ -58,22 +65,34 @@ pub rec Match {
 # ---
 # a:       the allocator it lives in
 # prog:    its program
+# rev:     its program read backward, for finding where a match begins
 # names:   the bytes of every group name, one after another
 # offsets: where each group's name starts in names, one more than the groups
 # longest: it matches leftmost-longest
+# onepass: its one-pass table, ready when the program is one-pass
 pub rec Regex {
     a:       *A.Allocator;
     prog:    Prog;
+    rev:     Prog;
     names:   Vector[u8];
     offsets: Vector[usize];
     longest: bool;
+    onepass: onepass.OnePass;
 }
 
 # the scratch of searching with one Regex
 # ---
-# vm: the pike vm's scratch
+# vm:  the pike vm's scratch
+# bt:  the bounded backtracker's scratch
+# one: the one-pass engine's scratch
+# fwd: the lazy dfa that finds where a match ends
+# bwd: the lazy dfa that finds where it begins
 pub rec Cache {
-    vm: pikevm.Cache;
+    vm:  pikevm.Cache;
+    bt:  backtrack.Cache;
+    one: onepass.Cache;
+    fwd: dfa.Dfa;
+    bwd: dfa.Dfa;
 }
 
 # where a search for successive matches has reached
@@ -106,12 +125,18 @@ pub fun compile_with(a: *A.Allocator, pattern: View, o: Options) res[Regex, Erro
     var tree:  res[syntax.Ast, syntax.Error] = syntax.parse(a, pattern, flags, o.literal);
     if (sel tree.err) { ret res[Regex, Error].err{tree.err}; }
     fin { syntax.dnit(?tree.ok); }
-    val p: res[Prog, Error] = program.compile(a, ?tree.ok);
+    var p: res[Prog, Error] = program.compile(a, ?tree.ok);
     if (sel p.err) { ret res[Regex, Error].err{p.err}; }
-    var re: Regex = Regex{a: a, prog: p.ok, names: vector.init[u8](a), offsets: vector.init[usize](a), longest: o.longest};
+    val r: res[Prog, Error] = program.reverse(a, ?tree.ok);
+    if (sel r.err) {
+        program.dnit(?p.ok);
+        ret res[Regex, Error].err{r.err};
+    }
+    var re:    Regex              = Regex{a: a, prog: p.ok, rev: r.ok, names: vector.init[u8](a), offsets: vector.init[usize](a), longest: o.longest, onepass: onepass.init(a)};
+    val built: res[bool, A.Error] = onepass.build(a, ?re.prog, ?re.onepass);
     # names borrow the pattern, so the Regex keeps its own copy
     var g:  usize = 0;
-    var ok: bool  = true;
+    var ok: bool  = sel built.ok;
     for (g < tree.ok.names.len && ok) {
         val started: res[usize, A.Error] = vector.push[usize](?re.offsets, re.names.len);
         ok = sel started.ok;
@@ -140,6 +165,8 @@ pub fun compile_with(a: *A.Allocator, pattern: View, o: Options) res[Regex, Erro
 # re: the Regex
 pub fun dnit(re: *Regex) {
     program.dnit(?re.prog);
+    program.dnit(?re.rev);
+    onepass.dnit(?re.onepass);
     vector.dnit[u8](?re.names);
     vector.dnit[usize](?re.offsets);
 }
@@ -158,8 +185,33 @@ pub fun error_text(e: Error) str {
 # re:  the Regex it serves
 # ret: the Cache, or the memory error
 pub fun cache(a: *A.Allocator, re: *Regex) res[Cache, Error] {
-    var c: Cache;
-    if (!pikevm.init(a, ?re.prog, ?c.vm)) { ret res[Cache, Error].err{Error{kind: Kind.memory{}, offset: 0}}; }
+    var c:    Cache;
+    val none: res[Cache, Error] = res[Cache, Error].err{Error{kind: Kind.memory{}, offset: 0}};
+    var kind: dfa.Kind          = dfa.Kind.first{};
+    if (re.longest)                       { kind = dfa.Kind.longest{}; }
+    if (!pikevm.init(a, ?re.prog, ?c.vm)) { ret none; }
+    if (!backtrack.init(a, ?re.prog, ?c.bt)) {
+        pikevm.dnit(?c.vm);
+        ret none;
+    }
+    if (!onepass.cache(a, ?re.prog, ?c.one)) {
+        pikevm.dnit(?c.vm);
+        backtrack.dnit(?c.bt);
+        ret none;
+    }
+    if (!dfa.init(a, ?re.prog, kind, false, ?c.fwd)) {
+        pikevm.dnit(?c.vm);
+        backtrack.dnit(?c.bt);
+        onepass.cache_dnit(?c.one);
+        ret none;
+    }
+    if (!dfa.init(a, ?re.rev, dfa.Kind.all{}, true, ?c.bwd)) {
+        pikevm.dnit(?c.vm);
+        backtrack.dnit(?c.bt);
+        onepass.cache_dnit(?c.one);
+        dfa.dnit(?c.fwd);
+        ret none;
+    }
     ret res[Cache, Error].ok{c};
 }
 
@@ -168,6 +220,10 @@ pub fun cache(a: *A.Allocator, re: *Regex) res[Cache, Error] {
 # c: the Cache
 pub fun cache_dnit(c: *Cache) {
     pikevm.dnit(?c.vm);
+    backtrack.dnit(?c.bt);
+    onepass.cache_dnit(?c.one);
+    dfa.dnit(?c.fwd);
+    dfa.dnit(?c.bwd);
 }
 
 # the number of capturing groups, not counting the whole match
@@ -228,6 +284,29 @@ fun aligned(text: View, from: usize) usize {
     ret at;
 }
 
+# where the lazy dfas found the leftmost match
+# ---
+# none:    there is none
+# found:   the match
+# gave_up: a dfa gave up, and the pike vm must search
+tag Bounds: u8 {
+    none;
+    found: Match;
+    gave_up;
+}
+
+# the leftmost match at or after from, forward to where it ends, then backward
+# to the earliest position it can begin
+fun bounds(re: *Regex, c: *Cache, text: View, from: usize) Bounds {
+    val end: dfa.Outcome = dfa.forward(?c.fwd, ?re.prog, text, from, false);
+    if (sel end.none) { ret Bounds.none{}; }
+    if (sel end.found) {
+        val begin: dfa.Outcome = dfa.backward(?c.bwd, ?re.rev, text, from, end.found);
+        if (sel begin.found) { ret Bounds.found{Match{start: begin.found, end: end.found}}; }
+    }
+    ret Bounds.gave_up{};
+}
+
 # whether the Regex matches anywhere in a text
 # ---
 # re:   the Regex
@@ -235,8 +314,12 @@ fun aligned(text: View, from: usize) usize {
 # text: the text
 # ret:  whether there is a match
 pub fun is_match(re: *Regex, c: *Cache, text: View) bool {
-    val m: opt[Match] = find(re, c, text, 0);
-    ret sel m.some;
+    val o: dfa.Outcome = dfa.forward(?c.fwd, ?re.prog, text, 0, true);
+    if (sel o.gave_up) {
+        var b: [2]usize;
+        ret pikevm.search(?re.prog, ?c.vm, text, 0, false, re.longest, 2, ?b[0]);
+    }
+    ret sel o.found;
 }
 
 # the leftmost match at or after an offset
@@ -248,9 +331,13 @@ pub fun is_match(re: *Regex, c: *Cache, text: View) bool {
 # ret:  the match, or none
 pub fun find(re: *Regex, c: *Cache, text: View, from: usize) opt[Match] {
     if (from > text.len) { ret opt[Match].none{}; }
-    var bounds: [2]usize;
-    if (!pikevm.search(?re.prog, ?c.vm, text, aligned(text, from), false, re.longest, 2, ?bounds[0])) { ret opt[Match].none{}; }
-    ret opt[Match].some{Match{start: bounds[0], end: bounds[1]}};
+    val at: usize  = aligned(text, from);
+    val b:  Bounds = bounds(re, c, text, at);
+    if (sel b.found) { ret opt[Match].some{b.found}; }
+    if (sel b.none)  { ret opt[Match].none{}; }
+    var vm: [2]usize;
+    if (!pikevm.search(?re.prog, ?c.vm, text, at, false, re.longest, 2, ?vm[0])) { ret opt[Match].none{}; }
+    ret opt[Match].some{Match{start: vm[0], end: vm[1]}};
 }
 
 # the leftmost match at or after an offset, with every group's bounds
@@ -266,7 +353,20 @@ pub fun find(re: *Regex, c: *Cache, text: View, from: usize) opt[Match] {
 # ret:   whether there is a match
 pub fun captures(re: *Regex, c: *Cache, text: View, from: usize, slots: *usize) bool {
     if (from > text.len) { ret false; }
-    ret pikevm.search(?re.prog, ?c.vm, text, aligned(text, from), false, re.longest, slot_count(re), slots);
+    val at: usize  = aligned(text, from);
+    val b:  Bounds = bounds(re, c, text, at);
+    if (sel b.none) { ret false; }
+    if (sel b.found) {
+        # the match begins where the dfas found, so an anchored engine need only resolve its groups
+        # and it ends where they found, so neither need read past that
+        val start: usize = b.found.start;
+        val end:   usize = b.found.end;
+        if (re.onepass.ready)                   { ret onepass.search(?re.prog, ?re.onepass, ?c.one, text, start, re.longest, slot_count(re), slots); }
+        if (backtrack.fits(?c.bt, end - start)) { ret backtrack.search_within(?re.prog, ?c.bt, text, start, end, true, re.longest, slot_count(re), slots); }
+        ret pikevm.search_within(?re.prog, ?c.vm, text, start, end, true, re.longest, slot_count(re), slots);
+    }
+    if (backtrack.fits(?c.bt, text.len - at)) { ret backtrack.search(?re.prog, ?c.bt, text, at, false, re.longest, slot_count(re), slots); }
+    ret pikevm.search(?re.prog, ?c.vm, text, at, false, re.longest, slot_count(re), slots);
 }
 
 # a search for successive matches from the start of a text
@@ -329,4 +429,649 @@ pub fun quote(text: View, out: *Vector[u8]) bool {
         k = k + 1;
     }
     ret true;
+}
+
+# a compiled pattern and its cache, over the testing allocator
+rec Fixture {
+    t:  testing.Testing;
+    re: Regex;
+    c:  Cache;
+    ok: bool;
+}
+
+#[testing]
+fun text(s: str) View {
+    ret view(s, str_len(s));
+}
+
+#[testing]
+fun open(f: *Fixture, pattern: str, o: Options) {
+    testing.make(?f.t);
+    val a:  *A.Allocator      = testing.allocator_of(?f.t);
+    val re: res[Regex, Error] = compile_with(a, text(pattern), o);
+    f.ok = false;
+    if (sel re.err) { ret; }
+    f.re = re.ok;
+    val c: res[Cache, Error] = cache(a, ?f.re);
+    if (sel c.err) {
+        dnit(?f.re);
+        ret;
+    }
+    f.c  = c.ok;
+    f.ok = true;
+}
+
+#[testing]
+fun close(f: *Fixture) bool {
+    if (f.ok) {
+        cache_dnit(?f.c);
+        dnit(?f.re);
+    }
+    val clean: bool = !testing.leaked(?f.t);
+    testing.dnit(?f.t);
+    ret clean;
+}
+
+# whether the first match at or after from is exactly start..end
+#[testing]
+fun finds(f: *Fixture, s: str, from: usize, start: usize, end: usize) bool {
+    val m: opt[Match] = find(?f.re, ?f.c, text(s), from);
+    if (sel m.none) { ret false; }
+    ret m.some.start == start && m.some.end == end;
+}
+
+#[testing]
+fun misses(f: *Fixture, s: str, from: usize) bool {
+    val m: opt[Match] = find(?f.re, ?f.c, text(s), from);
+    ret sel m.none;
+}
+
+test find__leftmost_first_and_longest {
+    var o: Options;
+    var f: Fixture;
+    open(?f, "a|ab", o);
+    if (!f.ok || !finds(?f, "xab", 0, 1, 2)) { ret 1; }
+    if (!close(?f))                          { ret 2; }
+    o.longest = true;
+    open(?f, "a|ab", o);
+    if (!f.ok || !finds(?f, "xab", 0, 1, 3)) { ret 3; }
+    if (!close(?f))                          { ret 4; }
+    o.longest = false;
+    open(?f, "a+?", o);
+    if (!f.ok || !finds(?f, "aaa", 0, 0, 1)) { ret 5; }
+    if (!close(?f))                          { ret 6; }
+    open(?f, "b", o);
+    if (!f.ok || !finds(?f, "abab", 2, 3, 4) || !misses(?f, "abab", 4)) { ret 7; }
+    if (!close(?f))                                                     { ret 8; }
+    ret 0;
+}
+
+test find__anchors_and_boundaries {
+    var o: Options;
+    var f: Fixture;
+    open(?f, "^b", o);
+    # ^ is the start of the text, not of the search
+    if (!f.ok || !misses(?f, "ab", 1)) { ret 1; }
+    if (!close(?f))                    { ret 2; }
+    o.multi_line = true;
+    open(?f, "^b$", o);
+    if (!f.ok || !finds(?f, "a\nb\nc", 0, 2, 3)) { ret 3; }
+    if (!close(?f))                              { ret 4; }
+    o.multi_line = false;
+    open(?f, "\\bcat\\b", o);
+    if (!f.ok || !finds(?f, "concat cat", 0, 7, 10)) { ret 5; }
+    if (!close(?f))                                  { ret 6; }
+    open(?f, "b$", o);
+    # $ without (?m) is only the end of the text, not before a final newline
+    if (!f.ok || !misses(?f, "ab\n", 0)) { ret 7; }
+    if (!close(?f))                      { ret 8; }
+    ret 0;
+}
+
+test find__no_empty_match_inside_a_code_point {
+    var f: Fixture;
+    var o: Options;
+    open(?f, "\\B", o);
+    # \B holds between the two bytes of \xc3\xa9, which is no boundary, so the match is at the end
+    if (!f.ok || !finds(?f, "a\xc3\xa9", 0, 3, 3)) { ret 1; }
+    if (!close(?f))                                { ret 2; }
+    ret 0;
+}
+
+test find__utf8_text {
+    var o: Options;
+    var f: Fixture;
+    open(?f, "\\x{e9}.", o);
+    if (!f.ok || !finds(?f, "caf\xC3\xA9\xE2\x82\xAC!", 0, 3, 8)) { ret 1; }
+    if (!close(?f))                                               { ret 2; }
+    open(?f, "a.b", o);
+    # . never matches an invalid byte
+    if (!f.ok || !misses(?f, "a\xFFb", 0)) { ret 3; }
+    if (!close(?f))                        { ret 4; }
+    open(?f, "x*", o);
+    # a search from inside a code point starts at the next boundary
+    if (!f.ok || !finds(?f, "\xC3\xA9", 1, 2, 2)) { ret 5; }
+    if (!close(?f))                               { ret 6; }
+    ret 0;
+}
+
+test captures__groups_and_names {
+    var o: Options;
+    var f: Fixture;
+    open(?f, "(a)(?P<b>b)?(c)", o);
+    if (!f.ok || group_count(?f.re) != 3 || slot_count(?f.re) != 8) { ret 1; }
+    var slots: [8]usize;
+    if (!captures(?f.re, ?f.c, text("xac"), 0, ?slots[0]))                      { ret 2; }
+    if (slots[0] != 1 || slots[1] != 3 || slots[2] != 1 || slots[3] != 2)       { ret 3; }
+    if (slots[4] != NONE || slots[5] != NONE || slots[6] != 2 || slots[7] != 3) { ret 4; }
+    val b: opt[usize] = group_index(?f.re, text("b"));
+    if (sel b.none)  { ret 5; }
+    if (b.some != 2) { ret 6; }
+    val missing: opt[usize] = group_index(?f.re, text("zz"));
+    if (sel missing.some)                                               { ret 7; }
+    if (group_name(?f.re, 2).len != 1 || group_name(?f.re, 1).len != 0) { ret 8; }
+    if (!close(?f))                                                     { ret 9; }
+    ret 0;
+}
+
+test next__iterates_as_go_does {
+    var o: Options;
+    var f: Fixture;
+    open(?f, "a*", o);
+    if (!f.ok) { ret 1; }
+    # "baaa" gives the empty match at 0 and aaa, never the empty match right after it
+    var it:  Iter       = iter();
+    val one: opt[Match] = next(?f.re, ?f.c, text("baaa"), ?it);
+    val two: opt[Match] = next(?f.re, ?f.c, text("baaa"), ?it);
+    val end: opt[Match] = next(?f.re, ?f.c, text("baaa"), ?it);
+    if (sel one.none)                                                                         { ret 2; }
+    if (sel two.none)                                                                         { ret 2; }
+    if (sel end.some)                                                                         { ret 2; }
+    if (one.some.start != 0 || one.some.end != 0 || two.some.start != 1 || two.some.end != 4) { ret 3; }
+    if (!close(?f))                                                                           { ret 4; }
+    ret 0;
+}
+
+test search__linear_on_a_pathological_pattern {
+    var o: Options;
+    var f: Fixture;
+    open(?f, "(a*)*b", o);
+    if (!f.ok) { ret 1; }
+    var run: [20001]u8;
+    var k:   usize = 0;
+    for (k < 20000) {
+        run[k] = 'a';
+        k      = k + 1;
+    }
+    run[20000] = 0;
+    if (!misses(?f, ?run[0], 0)) { ret 2; }
+    if (!close(?f))              { ret 3; }
+    ret 0;
+}
+
+test search__makes_no_allocation {
+    var o: Options;
+    var f: Fixture;
+    open(?f, "(\\w+)@(\\w+)\\.com", o);
+    if (!f.ok) { ret 1; }
+    val before: usize = testing.total_count(?f.t);
+    var slots:  [6]usize;
+    if (!captures(?f.re, ?f.c, text("mail me at ann@example.com"), 0, ?slots[0])) { ret 2; }
+    if (!is_match(?f.re, ?f.c, text("bob@site.com")))                             { ret 3; }
+    if (testing.total_count(?f.t) != before)                                      { ret 4; }
+    if (slots[2] != 11 || slots[3] != 14)                                         { ret 5; }
+    if (!close(?f))                                                               { ret 6; }
+    # the same through the one-pass engine, anchored at the start of the text
+    open(?f, "^(\\w+)@(\\w+)\\.com", o);
+    if (!f.ok || !f.re.onepass.ready) { ret 7; }
+    val again: usize = testing.total_count(?f.t);
+    if (!captures(?f.re, ?f.c, text("ann@example.com"), 0, ?slots[0]))     { ret 8; }
+    if (testing.total_count(?f.t) != again)                                { ret 9; }
+    if (slots[2] != 0 || slots[3] != 3 || slots[4] != 4 || slots[5] != 11) { ret 10; }
+    if (!close(?f))                                                        { ret 11; }
+    ret 0;
+}
+
+test compile__options_and_errors {
+    var o: Options;
+    var f: Fixture;
+    o.case_insensitive = true;
+    o.dot_all          = true;
+    open(?f, "k.", o);
+    if (!f.ok || !finds(?f, "\xE2\x84\xAA\n", 0, 0, 4)) { ret 1; }
+    if (!close(?f))                                     { ret 2; }
+    var lit: Options;
+    lit.literal = true;
+    open(?f, "a.b*", lit);
+    if (!f.ok || !finds(?f, "xa.b*", 0, 1, 5) || !misses(?f, "aab", 0)) { ret 3; }
+    if (!close(?f))                                                     { ret 4; }
+    var t: testing.Testing;
+    testing.make(?t);
+    val bad: res[Regex, Error] = compile(testing.allocator_of(?t), text("a(b"));
+    if (sel bad.ok)                                               { ret 5; }
+    if (bad.err.offset != 1 || str_len(error_text(bad.err)) == 0) { ret 6; }
+    testing.dnit(?t);
+    ret 0;
+}
+
+test quote__matches_its_text_exactly {
+    var t: testing.Testing;
+    testing.make(?t);
+    val a:   *A.Allocator = testing.allocator_of(?t);
+    var out: Vector[u8]   = vector.init[u8](a);
+    val raw: str          = "1+1=2? (a|b) [x] {y} ^$ \\ .*";
+    if (!quote(text(raw), ?out)) { ret 1; }
+    val re: res[Regex, Error] = compile(a, view(out.data, out.len));
+    if (sel re.err) { ret 2; }
+    var r: Regex             = re.ok;
+    val c: res[Cache, Error] = cache(a, ?r);
+    if (sel c.err) { ret 3; }
+    var k: Cache      = c.ok;
+    val m: opt[Match] = find(?r, ?k, text(raw), 0);
+    if (sel m.none)                                      { ret 4; }
+    if (m.some.start != 0 || m.some.end != str_len(raw)) { ret 5; }
+    cache_dnit(?k);
+    dnit(?r);
+    vector.dnit[u8](?out);
+    if (testing.leaked(?t)) { ret 6; }
+    testing.dnit(?t);
+    ret 0;
+}
+
+test search__prefix_scan_steps_only_at_candidates {
+    var o: Options;
+    var f: Fixture;
+    open(?f, "(hello) \\w+", o);
+    if (!f.ok || f.re.prog.prefix_len != 6) { ret 1; }
+    # a decoy that shares the first bytes, then the match past a long run of filler
+    var big: [10020]u8;
+    var k:   usize = 0;
+    for (k < 10000) {
+        big[k] = 'x';
+        k      = k + 1;
+    }
+    big[5000] = 'h';
+    big[5001] = 'e';
+    big[5002] = 'l';
+    big[5003] = 'p';
+    val tail: str = "hello world";
+    k = 0;
+    for (k < 11) {
+        big[10000 + k] = tail[k];
+        k              = k + 1;
+    }
+    big[10011] = 0;
+    if (!finds(?f, ?big[0], 0, 10000, 10011)) { ret 2; }
+    # the vm ran only from the one candidate through the match
+    if (f.c.vm.steps > 16) { ret 3; }
+    if (!close(?f))        { ret 4; }
+    # no prefix is taken past a choice, a fold or an assertion
+    open(?f, "(?i)hello", o);
+    if (!f.ok || f.re.prog.prefix_len != 0) { ret 5; }
+    if (!close(?f))                         { ret 6; }
+    open(?f, "ab|ac", o);
+    if (!f.ok || f.re.prog.prefix_len != 0) { ret 7; }
+    if (!close(?f))                         { ret 8; }
+    open(?f, "^ab", o);
+    if (!f.ok || f.re.prog.prefix_len != 0) { ret 9; }
+    if (!close(?f))                         { ret 10; }
+    ret 0;
+}
+
+# RE2's search tests, re2-search.txt from Go's src/regexp/testdata
+#
+# the file is a run of stanzas: "strings" and a list of quoted texts, then
+# "regexps" and a list of quoted patterns, each followed by one result line
+# per text. a result line holds four modes separated by semicolons, full match
+# then partial match under leftmost-first, then the same two under
+# leftmost-longest, each "-" for no match or the spans of the match and every
+# group, "-" for a group that took no part. a full match is the pattern
+# wrapped as ^(?:...)$. a pattern using \C, which neither Go nor RE2 in utf-8
+# mode supports, is skipped as Go's test skips it. the file is BSD licensed,
+# with its notice beside it in data/re2-search.LICENSE.
+#[embed("data/re2-search.txt")]
+val DATA: [_]u8;
+
+# the most failures reported in full
+val REPORT: usize = 20;
+
+# the state of the run
+# ---
+# a:        the allocator
+# texts:    the unquoted texts of the current stanza, one after another
+# starts:   where each text begins in texts, one more than the texts
+# pattern:  the unquoted pattern
+# wrapped:  the pattern as a full match
+# failures: how many checks failed
+# checks:   how many checks ran
+# onepass:  how many searches the one-pass engine and the pike vm agreed on
+# skipped:  how many patterns were skipped
+rec Run {
+    a:        *A.Allocator;
+    texts:    Vector[u8];
+    starts:   Vector[usize];
+    pattern:  Vector[u8];
+    wrapped:  Vector[u8];
+    failures: usize;
+    checks:   usize;
+    onepass:  usize;
+    skipped:  usize;
+}
+
+#[testing]
+fun hex(c: u8) u32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::u32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::u32 + 10; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::u32 + 10; }
+    ret 0;
+}
+
+#[testing]
+fun put(v: *Vector[u8], b: u8) {
+    vector.push[u8](v, b);
+}
+
+# append a go-quoted string, its quotes included in line, unquoted
+#[testing]
+fun unquote(line: View, out: *Vector[u8]) {
+    var i: usize = 1;
+    for (i + 1 < line.len) {
+        val c: u8 = line.data[i];
+        if (c != '\\') {
+            put(out, c);
+            i = i + 1;
+            cnt;
+        }
+        val e: u8 = line.data[i + 1];
+        i = i + 2;
+        if (e == 'n') { put(out, '\n'); }
+        or (e == 't') { put(out, '\t'); }
+        or (e == 'r') { put(out, '\r'); }
+        or (e == 'x') {
+            put(out, (hex(line.data[i]) * 16 + hex(line.data[i + 1]))::u8);
+            i = i + 2;
+        }
+        or { put(out, e); }
+    }
+}
+
+#[testing]
+fun show(label: *u8, v: View) {
+    print.eprint(label);
+    var buf: [2]u8;
+    buf[1] = 0;
+    var k: usize = 0;
+    for (k < v.len) {
+        buf[0] = v.data[k];
+        print.eprint(?buf[0]);
+        k = k + 1;
+    }
+    print.eprintln("");
+}
+
+# parse the next number in a result field, moving past it
+#[testing]
+fun number(f: View, i: *usize) usize {
+    var n: usize = 0;
+    for (@i < f.len && f.data[@i] >= '0' && f.data[@i] <= '9') {
+        n  = n * 10 + (f.data[@i] - '0')::usize;
+        @i = @i + 1;
+    }
+    ret n;
+}
+
+# check that a one-pass Regex gives what the pike vm gives anchored at every boundary
+#[testing]
+fun agrees(r: *Run, re: *Regex, c: *Cache, text: View, mode: *u8) {
+    val count: usize = slot_count(re);
+    if (!re.onepass.ready || count > 64) { ret; }
+    var mine:  [64]usize;
+    var vms:   [64]usize;
+    var start: usize = 0;
+    for (start <= text.len) {
+        if (pikevm.boundary(text, start)) {
+            r.onepass = r.onepass + 1;
+            val got:  bool  = onepass.search(?re.prog, ?re.onepass, ?c.one, text, start, re.longest, count, ?mine[0]);
+            val want: bool  = pikevm.search(?re.prog, ?c.vm, text, start, true, re.longest, count, ?vms[0]);
+            var same: bool  = got == want;
+            var k:    usize = 0;
+            for (same && want && k < count) {
+                same = mine[k] == vms[k];
+                k    = k + 1;
+            }
+            if (!same) {
+                r.failures = r.failures + 1;
+                if (r.failures <= REPORT) {
+                    print.eprint("one-pass disagrees with the pike vm in ");
+                    print.eprintln(mode);
+                    show("  pattern: ", view(r.pattern.data, r.pattern.len));
+                    show("  text:    ", text);
+                    print.eprintlnf("  start:   {}", start);
+                }
+            }
+        }
+        start = start + 1;
+    }
+}
+
+# check one mode's result field against a search
+#[testing]
+fun check(r: *Run, re: *Regex, c: *Cache, text: View, field: View, mode: *u8) {
+    r.checks = r.checks + 1;
+    var slots: [64]usize;
+    val count: usize = slot_count(re);
+    var found: bool  = false;
+    if (count <= 64) { found = captures(re, c, text, 0, ?slots[0]); }
+    var ok: bool = true;
+    # the lazy dfas alone find the same match, never giving up on texts this small
+    var agree: bool = true;
+    if (count <= 64) {
+        val b: Bounds = bounds(re, c, text, 0);
+        if (sel b.found) { agree = found && b.found.start == slots[0] && b.found.end == slots[1]; }
+        or (sel b.none)  { agree = !found; }
+        or               { agree = false; }
+    }
+    if (field.len == 1 && field.data[0] == '-') {
+        ok = !found;
+    }
+    or {
+        if (!found) { ok = false; }
+        var i:    usize = 0;
+        var slot: usize = 0;
+        for (ok && i < field.len) {
+            if (field.data[i] == ' ') {
+                i = i + 1;
+                cnt;
+            }
+            if (field.data[i] == '-') {
+                ok   = slot + 1 < count && slots[slot] == NONE && slots[slot + 1] == NONE;
+                i    = i + 1;
+                slot = slot + 2;
+                cnt;
+            }
+            val lo: usize = number(field, ?i);
+            i = i + 1;
+            val hi: usize = number(field, ?i);
+            ok   = slot + 1 < count && slots[slot] == lo && slots[slot + 1] == hi;
+            slot = slot + 2;
+        }
+    }
+    if (ok && agree) { ret; }
+    r.failures = r.failures + 1;
+    if (r.failures > REPORT) { ret; }
+    print.eprint("mismatch in ");
+    print.eprintln(mode);
+    if (!agree) { print.eprintln("  the lazy dfas disagree with the match"); }
+    show("  pattern: ", view(r.pattern.data, r.pattern.len));
+    show("  text:    ", text);
+    show("  want:    ", field);
+    print.eprint("  got:     ");
+    if (!found) { print.eprintln("-"); }
+    or {
+        var k: usize = 0;
+        for (k < count) {
+            if (slots[k] == NONE) { print.eprintf("-1 "); }
+            or                    { print.eprintf("{} ", slots[k]); }
+            k = k + 1;
+        }
+        print.eprintln("");
+    }
+}
+
+# the four regexes of one pattern
+rec Four {
+    re: [4]Regex;
+    c:  [4]Cache;
+    ok: bool;
+}
+
+#[testing]
+fun compile_four(r: *Run, f: *Four) {
+    var o: Options;
+    f.ok          = true;
+    r.wrapped.len = 0;
+    put(?r.wrapped, '^');
+    put(?r.wrapped, '(');
+    put(?r.wrapped, '?');
+    put(?r.wrapped, ':');
+    var k: usize = 0;
+    for (k < r.pattern.len) {
+        put(?r.wrapped, r.pattern.data[k]);
+        k = k + 1;
+    }
+    put(?r.wrapped, ')');
+    put(?r.wrapped, '$');
+    var m: usize = 0;
+    for (m < 4) {
+        o.longest = m >= 2;
+        var src: View = view(r.pattern.data, r.pattern.len);
+        if (m % 2 == 0) { src = view(r.wrapped.data, r.wrapped.len); }
+        val re: res[Regex, Error] = compile_with(r.a, src, o);
+        if (sel re.err) {
+            f.ok = false;
+            ret;
+        }
+        f.re[m] = re.ok;
+        val c: res[Cache, Error] = cache(r.a, ?f.re[m]);
+        if (sel c.err) {
+            f.ok = false;
+            ret;
+        }
+        f.c[m] = c.ok;
+        m      = m + 1;
+    }
+}
+
+#[testing]
+fun release_four(f: *Four) {
+    var m: usize = 0;
+    for (m < 4) {
+        cache_dnit(?f.c[m]);
+        dnit(?f.re[m]);
+        m = m + 1;
+    }
+}
+
+#[testing]
+fun has_capital_c(p: *Vector[u8]) bool {
+    var k: usize = 0;
+    for (k + 1 < p.len) {
+        if (p.data[k] == '\\' && p.data[k + 1] == 'C') { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+test conformance__re2_search {
+    var src: heap.Source;
+    var h:   heap.Heap;
+    var a:   A.Allocator;
+    heap.native_source(?src);
+    heap.init(?h, ?src, 0);
+    heap.make(?a, ?h);
+    var r: Run = Run{
+        a:       ?a,
+        texts:   vector.init[u8](?a),
+        starts:  vector.init[usize](?a),
+        pattern: vector.init[u8](?a),
+        wrapped: vector.init[u8](?a),
+    };
+    val modes: [4]*u8 = [4]*u8{"full match", "partial match", "full match, longest", "partial match, longest"};
+    val len:   usize  = $length_of(DATA);
+    var i:     usize  = 0;
+    var state: u8     = 0;
+    var four:  Four;
+    var text:  usize  = 0;
+    var skip:  bool   = false;
+    for (i < len) {
+        var end: usize = i;
+        for (end < len && DATA[end] != '\n') { end = end + 1; }
+        val line: View = view(?DATA[i], end - i);
+        i = end + 1;
+        if (line.len == 0 || line.data[0] == '#') { cnt; }
+        if (line.data[0] == '"') {
+            if (state == 1) {
+                vector.push[usize](?r.starts, r.texts.len);
+                unquote(line, ?r.texts);
+                cnt;
+            }
+            # a new pattern: finish the last, then compile this one
+            if (four.ok) {
+                release_four(?four);
+                four.ok = false;
+            }
+            r.pattern.len = 0;
+            unquote(line, ?r.pattern);
+            compile_four(?r, ?four);
+            skip = false;
+            if (!four.ok) {
+                if (has_capital_c(?r.pattern)) {
+                    r.skipped = r.skipped + 1;
+                    skip      = true;
+                }
+                or {
+                    r.failures = r.failures + 1;
+                    show("does not compile: ", view(r.pattern.data, r.pattern.len));
+                    skip = true;
+                }
+            }
+            text = 0;
+            cnt;
+        }
+        if (line.data[0] == 's' && line.len == 7) {
+            state        = 1;
+            r.texts.len  = 0;
+            r.starts.len = 0;
+            cnt;
+        }
+        if (line.data[0] == 'r' && line.len == 7) {
+            state = 2;
+            vector.push[usize](?r.starts, r.texts.len);
+            cnt;
+        }
+        if (state != 2 || (line.data[0] != '-' && (line.data[0] < '0' || line.data[0] > '9'))) { cnt; }
+        # a result line for the next text
+        if (!skip && text + 1 < r.starts.len) {
+            val t:     View  = view(?r.texts.data[r.starts.data[text]], r.starts.data[text + 1] - r.starts.data[text]);
+            var field: usize = 0;
+            var from:  usize = 0;
+            var k:     usize = 0;
+            for (k <= line.len && field < 4) {
+                if (k == line.len || line.data[k] == ';') {
+                    check(?r, ?four.re[field], ?four.c[field], t, view(?line.data[from], k - from), modes[field]);
+                    agrees(?r, ?four.re[field], ?four.c[field], t, modes[field]);
+                    field = field + 1;
+                    from  = k + 1;
+                }
+                k = k + 1;
+            }
+        }
+        text = text + 1;
+    }
+    if (four.ok) { release_four(?four); }
+    print.eprintlnf("{} checks, {} one-pass agreements, {} failures, {} patterns skipped", r.checks, r.onepass, r.failures, r.skipped);
+    if (r.failures > 0)   { ret 1; }
+    if (r.checks < 1000)  { ret 2; }
+    if (r.onepass < 1000) { ret 3; }
+    ret 0;
 }

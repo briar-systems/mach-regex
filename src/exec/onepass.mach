@@ -1,0 +1,560 @@
+# the one-pass engine: captures in a single deterministic pass when anchored
+#
+# a program is one-pass when, searched from a fixed start, at most one thread
+# is ever alive: from any instruction a byte continues along at most one path
+# of the empty-width closure, and at most one path reaches the match. such a
+# program is a table with a row per state, the instruction a byte leads to or
+# the start, and a column per byte class, each entry naming the next state,
+# the capture slots to record and the assertions that must hold on the way,
+# and a last column for the match. RE2 and Rust's regex-automata build the
+# same table. a search walks it one byte at a time with one set of slots, and
+# gives exactly what the pike vm gives anchored at the same start, under
+# leftmost-first and leftmost-longest alike. all scratch is in a Cache sized
+# for the program, so a search makes no allocation.
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.math.bits;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use regex.compile;
+use regex.compile.program.Assert;
+use regex.compile.program.Inst;
+use regex.compile.program.Prog;
+use regex.compile.program.Trans;
+use regex.exec.pikevm;
+use regex.syntax;
+
+# a capture slot no thread has set
+pub val NONE: usize = 0xFFFFFFFFFFFFFFFF;
+
+# the most capture slots a one-pass program has, one bit each in an Entry
+pub val MAX_SLOTS: u32 = 64;
+
+# the most bytes a table takes before the program is left to the pike vm
+pub val MAX_BYTES: usize = 1 << 20;
+
+# an entry's next when the class leads nowhere
+val DEAD: u32 = 0xFFFFFFFF;
+
+# the match column's next when the state can match
+val MATCH: u32 = 0xFFFFFFFE;
+
+# what a state does on one byte class, or on reaching the match
+# ---
+# next:  the state after the byte, DEAD for none, or in the match column MATCH
+# looks: the assertions that must hold before the byte, one bit each
+# after: the match is preferred to this byte, so leftmost-first stops at it
+# saves: the capture slots recorded before the byte, one bit each
+pub rec Entry {
+    next:  u32;
+    looks: u8;
+    after: u8;
+    saves: u64;
+}
+
+# a program's one-pass table
+# ---
+# table:  the rows, stride entries each, state 0 first
+# stride: the program's class count and one more for the match
+# ready:  the program is one-pass and the table is built
+pub rec OnePass {
+    table:  Vector[Entry];
+    stride: usize;
+    ready:  bool;
+}
+
+# the scratch of a search, sized for one program
+# ---
+# thread: the slots of the one thread
+# best:   the slots of the best match so far
+pub rec Cache {
+    thread: Vector[usize];
+    best:   Vector[usize];
+}
+
+# a pending path of the empty-width closure
+# ---
+# pc:    the instruction it reached
+# looks: the assertions it passed
+# saves: the slots it recorded
+rec Frame {
+    pc:    u32;
+    looks: u8;
+    saves: u64;
+}
+
+# the analysis of a program, alive only while its table is built
+# ---
+# p:      the program
+# op:     the table being built
+# state:  each instruction's state, or DEAD before a byte leads to it
+# pcs:    each state's instruction
+# seen:   the state whose closure last visited each instruction, plus one
+# stack:  the closure's pending paths
+# failed: the allocator refused
+# err:    what it refused with
+# split:  the program is not one-pass or its table is too large
+rec Build {
+    p:      *Prog;
+    op:     *OnePass;
+    state:  Vector[u32];
+    pcs:    Vector[u32];
+    seen:   Vector[u32];
+    stack:  Vector[Frame];
+    failed: bool;
+    err:    A.Error;
+    split:  bool;
+}
+
+# an empty table drawing on an allocator
+# ---
+# a:   the allocator its table grows in
+# ret: the table, not ready and owning nothing
+pub fun init(a: *A.Allocator) OnePass {
+    ret OnePass{table: vector.init[Entry](a), stride: 0, ready: false};
+}
+
+# release a table
+# ---
+# op: the table
+pub fun dnit(op: *OnePass) {
+    vector.dnit[Entry](?op.table);
+}
+
+fun bit(a: Assert) u8 {
+    if (sel a.begin_line)    { ret 1; }
+    if (sel a.end_line)      { ret 2; }
+    if (sel a.begin_text)    { ret 4; }
+    if (sel a.end_text)      { ret 8; }
+    if (sel a.word_boundary) { ret 16; }
+    ret 32;
+}
+
+# whether every assertion in a set holds at a position of the text
+fun holding(looks: u8, text: View, at: usize) bool {
+    if ((looks & 1) != 0 && !pikevm.holds(Assert.begin_line{}, text, at))         { ret false; }
+    if ((looks & 2) != 0 && !pikevm.holds(Assert.end_line{}, text, at))           { ret false; }
+    if ((looks & 4) != 0 && !pikevm.holds(Assert.begin_text{}, text, at))         { ret false; }
+    if ((looks & 8) != 0 && !pikevm.holds(Assert.end_text{}, text, at))           { ret false; }
+    if ((looks & 16) != 0 && !pikevm.holds(Assert.word_boundary{}, text, at))     { ret false; }
+    if ((looks & 32) != 0 && !pikevm.holds(Assert.not_word_boundary{}, text, at)) { ret false; }
+    ret true;
+}
+
+fun grow[T](b: *Build, v: *Vector[T], value: T) {
+    val pushed: res[usize, A.Error] = vector.push[T](v, value);
+    if (sel pushed.err) {
+        b.failed = true;
+        b.err    = pushed.err;
+    }
+}
+
+# the state an instruction begins, made with an empty row when it is new
+fun state_of(b: *Build, pc: u32) u32 {
+    val have: u32 = b.state.data[pc];
+    if (have != DEAD) { ret have; }
+    if ((b.pcs.len + 1) * b.op.stride * $size_of(Entry) > MAX_BYTES) {
+        b.split = true;
+        ret DEAD;
+    }
+    val id: u32 = b.pcs.len::u32;
+    b.state.data[pc] = id;
+    grow[u32](b, ?b.pcs, pc);
+    # a row at a time, doubling, rather than an entry at a time
+    val t:    *Vector[Entry] = ?b.op.table;
+    val need: usize          = t.len + b.op.stride;
+    if (need > t.cap) {
+        var room: usize = t.cap * 2;
+        if (room < need) { room = need; }
+        val grown: res[usize, A.Error] = vector.ensure[Entry](t, room);
+        if (sel grown.err) {
+            b.failed = true;
+            ret DEAD;
+        }
+    }
+    val none: Entry = Entry{next: DEAD, looks: 0, after: 0, saves: 0};
+    var k:    usize = t.len;
+    for (k < need) {
+        t.data[k] = none;
+        k         = k + 1;
+    }
+    t.len = need;
+    ret id;
+}
+
+# enter the bytes lo through hi in a row, all leading to the instruction next
+fun enter(b: *Build, row: usize, lo: u8, hi: u8, next: u32, f: Frame, matched: bool) {
+    val to: u32 = state_of(b, next);
+    if (b.failed || b.split) { ret; }
+    var last: usize = 256;
+    var at:   usize = lo::usize;
+    for (at <= hi::usize) {
+        val cls: usize = b.p.classes[at]::usize;
+        at = at + 1;
+        if (cls == last) { cnt; }
+        last = cls;
+        val e: *Entry = ?b.op.table.data[row + cls];
+        # a second path on the same byte is a second thread
+        if (e.next != DEAD) {
+            b.split = true;
+            ret;
+        }
+        e.next  = to;
+        e.looks = f.looks;
+        e.after = matched;
+        e.saves = f.saves;
+    }
+}
+
+# fill a state's row from the empty-width closure of its instruction
+#
+# the closure is walked in priority order, as the pike vm adds threads, so a
+# byte met after the match is one leftmost-first gives up for the match.
+fun closure(b: *Build, id: u32) {
+    val row:     usize = id::usize * b.op.stride;
+    val stamp:   u32   = id + 1;
+    var matched: bool  = false;
+    b.stack.len = 0;
+    grow[Frame](b, ?b.stack, Frame{pc: b.pcs.data[id], looks: 0, saves: 0});
+    for (b.stack.len > 0 && !b.failed && !b.split) {
+        b.stack.len = b.stack.len - 1;
+        var f: Frame = b.stack.data[b.stack.len];
+        for (!b.failed && !b.split) {
+            # two paths to one instruction are two threads
+            if (b.seen.data[f.pc] == stamp) {
+                b.split = true;
+                brk;
+            }
+            b.seen.data[f.pc] = stamp;
+            val i: Inst = b.p.insts.data[f.pc];
+            if (sel i.split) {
+                grow[Frame](b, ?b.stack, Frame{pc: i.split.y, looks: f.looks, saves: f.saves});
+                f.pc = i.split.x;
+                cnt;
+            }
+            if (sel i.save) {
+                f.saves = f.saves | (1u64 << i.save.slot::u64);
+                f.pc    = i.save.next;
+                cnt;
+            }
+            if (sel i.look) {
+                f.looks = f.looks | bit(i.look.assert);
+                f.pc    = i.look.next;
+                cnt;
+            }
+            if (sel i.match) {
+                b.op.table.data[row + b.op.stride - 1] = Entry{next: MATCH, looks: f.looks, after: 0, saves: f.saves};
+                matched                                = true;
+            }
+            or (sel i.range) {
+                enter(b, row, i.range.lo, i.range.hi, i.range.next, f, matched);
+            }
+            or (sel i.sparse) {
+                var k: u32 = 0;
+                for (k < i.sparse.len && !b.failed && !b.split) {
+                    val t: Trans = b.p.trans.data[i.sparse.start + k];
+                    enter(b, row, t.lo, t.hi, t.next, f, matched);
+                    k = k + 1;
+                }
+            }
+            brk;
+        }
+    }
+}
+
+fun filled(b: *Build, v: *Vector[u32], n: usize, value: u32) {
+    var k: usize = 0;
+    for (k < n && !b.failed) {
+        grow[u32](b, v, value);
+        k = k + 1;
+    }
+}
+
+# decide whether a program is one-pass and, when it is, build its table
+#
+# a program with more than MAX_SLOTS slots, or whose table would take more
+# than MAX_BYTES, is left to the pike vm like one that is not one-pass.
+# ---
+# a:   the allocator the analysis borrows scratch from
+# p:   the program
+# op:  a table made by init for the program, ready when this gives true
+# ret: whether the table is built, or the memory error
+pub fun build(a: *A.Allocator, p: *Prog, op: *OnePass) res[bool, A.Error] {
+    op.table.len = 0;
+    op.ready     = false;
+    op.stride    = p.class_count::usize + 1;
+    if (p.slots > MAX_SLOTS) { ret res[bool, A.Error].ok{false}; }
+    var b: Build = Build{
+        p:     p,
+        op:    op,
+        state: vector.init[u32](a),
+        pcs:   vector.init[u32](a),
+        seen:  vector.init[u32](a),
+        stack: vector.init[Frame](a),
+    };
+    fin {
+        vector.dnit[u32](?b.state);
+        vector.dnit[u32](?b.pcs);
+        vector.dnit[u32](?b.seen);
+        vector.dnit[Frame](?b.stack);
+    }
+    filled(?b, ?b.state, p.insts.len, DEAD);
+    filled(?b, ?b.seen, p.insts.len, 0);
+    state_of(?b, p.start);
+    var id: usize = 0;
+    for (id < b.pcs.len && !b.failed && !b.split) {
+        closure(?b, id::u32);
+        id = id + 1;
+    }
+    if (b.failed) {
+        op.table.len = 0;
+        ret res[bool, A.Error].err{b.err};
+    }
+    if (b.split) {
+        op.table.len = 0;
+        ret res[bool, A.Error].ok{false};
+    }
+    op.ready = true;
+    ret res[bool, A.Error].ok{true};
+}
+
+# grow a vector to n elements
+fun sized(v: *Vector[usize], n: usize) bool {
+    val grown: res[usize, A.Error] = vector.ensure[usize](v, n);
+    if (sel grown.err) { ret false; }
+    v.len = n;
+    ret true;
+}
+
+# make the scratch for searching a program
+# ---
+# a:   the allocator the scratch lives in
+# p:   the program
+# c:   the cache to fill
+# ret: false when the allocator refuses, leaving nothing held
+pub fun cache(a: *A.Allocator, p: *Prog, c: *Cache) bool {
+    c.thread = vector.init[usize](a);
+    c.best   = vector.init[usize](a);
+    val ok: bool = sized(?c.thread, p.slots::usize) && sized(?c.best, p.slots::usize);
+    if (!ok) { cache_dnit(c); }
+    ret ok;
+}
+
+# release a cache's scratch
+# ---
+# c: the cache
+pub fun cache_dnit(c: *Cache) {
+    vector.dnit[usize](?c.thread);
+    vector.dnit[usize](?c.best);
+}
+
+# record a position in the slots of a set, those below active
+fun record(saves: u64, active: usize, slots: *usize, at: usize) {
+    var left: u64 = saves;
+    for (left != 0) {
+        val k: usize = bits.ctz(left)::usize;
+        if (k < active) { slots[k] = at; }
+        left = left & (left - 1);
+    }
+}
+
+# search a text for a match beginning exactly at start
+#
+# gives what pikevm.search gives anchored at start with the same arguments:
+# the match's slots in out, the first active of them, with NONE for a group
+# that took no part.
+# ---
+# p:       the program
+# op:      its table, ready
+# c:       scratch sized for the program
+# text:    the text
+# start:   where the match must begin
+# longest: leftmost-longest rather than leftmost-first
+# active:  how many slots to record, at least 2 and at most the program's
+# out:     where the slots of the match go, active of them
+# ret:     whether there is a match
+pub fun search(p: *Prog, op: *OnePass, c: *Cache, text: View, start: usize, longest: bool, active: usize, out: *usize) bool {
+    if (!pikevm.boundary(text, start)) { ret false; }
+    var k: usize = 0;
+    for (k < active) {
+        c.thread.data[k] = NONE;
+        k                = k + 1;
+    }
+    val entries: *Entry = op.table.data;
+    var row:     usize  = 0;
+    var at:      usize  = start;
+    var matched: bool   = false;
+    for {
+        val m:    Entry = entries[row + op.stride - 1];
+        var here: bool  = false;
+        if (m.next == MATCH && (m.looks == 0 || holding(m.looks, text, at))) {
+            k = 0;
+            for (k < active) {
+                c.best.data[k] = c.thread.data[k];
+                k              = k + 1;
+            }
+            record(m.saves, active, c.best.data, at);
+            matched = true;
+            here    = true;
+        }
+        if (at >= text.len) { brk; }
+        val e: Entry = entries[row + p.classes[text.data[at]::usize]::usize];
+        if (e.next == DEAD) { brk; }
+        # leftmost-first prefers the match to a byte met after it
+        if (here && !longest && e.after != 0)            { brk; }
+        if (e.looks != 0 && !holding(e.looks, text, at)) { brk; }
+        if (e.saves != 0)                                { record(e.saves, active, c.thread.data, at); }
+        row = e.next::usize * op.stride;
+        at  = at + 1;
+    }
+    if (!matched) { ret false; }
+    k = 0;
+    for (k < active) {
+        out[k] = c.best.data[k];
+        k      = k + 1;
+    }
+    ret true;
+}
+
+# a pattern's program, its table and the scratch of both engines
+rec Fixture {
+    t:    testing.Testing;
+    tree: syntax.Ast;
+    prog: Prog;
+    op:   OnePass;
+    one:  Cache;
+    vm:   pikevm.Cache;
+    ok:   bool;
+}
+
+#[testing]
+fun open(f: *Fixture, pattern: str, multiline: bool) {
+    testing.make(?f.t);
+    val a:     *A.Allocator = testing.allocator_of(?f.t);
+    var flags: syntax.Flags;
+    flags.multiline = multiline;
+    val tree: res[syntax.Ast, syntax.Error] = syntax.parse(a, view(pattern, str_len(pattern)), flags, false);
+    f.ok = false;
+    if (sel tree.err) { ret; }
+    f.tree = tree.ok;
+    val p: res[Prog, syntax.Error] = compile.compile(a, ?f.tree);
+    if (sel p.err) {
+        syntax.dnit(?f.tree);
+        ret;
+    }
+    f.prog = p.ok;
+    f.op   = init(a);
+    val built: res[bool, A.Error] = build(a, ?f.prog, ?f.op);
+    f.ok = sel built.ok && cache(a, ?f.prog, ?f.one) && pikevm.init(a, ?f.prog, ?f.vm);
+}
+
+#[testing]
+fun close(f: *Fixture) bool {
+    cache_dnit(?f.one);
+    pikevm.dnit(?f.vm);
+    dnit(?f.op);
+    compile.dnit(?f.prog);
+    syntax.dnit(?f.tree);
+    val clean: bool = !testing.leaked(?f.t);
+    testing.dnit(?f.t);
+    ret clean;
+}
+
+# whether a pattern is one-pass, and the analysis leaks nothing
+#[testing]
+fun one_pass(pattern: str) bool {
+    var f: Fixture;
+    open(?f, pattern, false);
+    val ready: bool = f.ok && f.op.ready;
+    ret close(?f) && ready;
+}
+
+# whether both engines agree anchored at every boundary of a text, in both modes
+#[testing]
+fun agree(f: *Fixture, s: str) bool {
+    val text:  View  = view(s, str_len(s));
+    val width: usize = f.prog.slots::usize;
+    var mine:  [16]usize;
+    var vms:   [16]usize;
+    var start: usize = 0;
+    for (start <= text.len) {
+        var mode: usize = 0;
+        for (mode < 2) {
+            var k: usize = 0;
+            for (k < 16) {
+                mine[k] = 7;
+                vms[k]  = 7;
+                k       = k + 1;
+            }
+            val longest: bool = mode == 1;
+            val got:     bool = search(?f.prog, ?f.op, ?f.one, text, start, longest, width, ?mine[0]);
+            val want:    bool = pikevm.search(?f.prog, ?f.vm, text, start, true, longest, width, ?vms[0]);
+            if (got != want) { ret false; }
+            k = 0;
+            for (k < 16) {
+                if (mine[k] != vms[k]) { ret false; }
+                k = k + 1;
+            }
+            mode = mode + 1;
+        }
+        start = start + 1;
+    }
+    ret true;
+}
+
+test onepass__analysis {
+    if (!one_pass("abc") || !one_pass("(a*)b") || !one_pass("(\\w+)@(\\w+)\\.com") || !one_pass("^(?:x|y)(z+)?$")) { ret 1; }
+    if (!one_pass("(\\d+)-(\\d+)") || !one_pass("a*?b") || !one_pass("\\x{e9}(.)") || !one_pass("a(?:$|b)"))       { ret 2; }
+    # a byte two paths could take is two threads
+    if (one_pass("a*a") || one_pass("(a|ab)") || one_pass("(.*)x") || one_pass("\\w+\\d") || one_pass("a?a?")) { ret 3; }
+    # two paths through one instruction
+    if (one_pass("(?:|)") || one_pass("(a*)*")) { ret 4; }
+    ret 0;
+}
+
+test onepass__agrees_with_the_pike_vm {
+    val patterns: [12]str = [12]str{
+        "(a*)b",
+        "(\\w+)@(\\w+)\\.com",
+        "^(?:x|y)(z+)?$",
+        "a(?:$|b)",
+        "(a+?)(b)?",
+        "(a*?)b",
+        "x(y?)(z*)",
+        "\\bfoo\\b(\\s*)",
+        "(\\x{e9}+)(x)?",
+        "((a)|(b))+c",
+        "(?:(a)|b)(?:(c)|d)",
+        "()(?:x)()",
+    };
+    val texts: [8]str = [8]str{"", "aab", "ann@site.com", "xzz", "yz\n", "ab a", "foo  bar", "\xC3\xA9\xC3\xA9x"};
+    var p:     usize  = 0;
+    for (p < 12) {
+        var f: Fixture;
+        open(?f, patterns[p], false);
+        if (!f.ok || !f.op.ready || f.prog.slots > 16) { ret 1; }
+        var t: usize = 0;
+        for (t < 8) {
+            if (!agree(?f, texts[t])) { ret 2; }
+            t = t + 1;
+        }
+        if (!close(?f)) { ret 3; }
+        p = p + 1;
+    }
+    var m: Fixture;
+    open(?m, "^(a)$", true);
+    if (!m.ok || !m.op.ready || !agree(?m, "b\na\nc")) { ret 4; }
+    if (!close(?m))                                    { ret 5; }
+    ret 0;
+}

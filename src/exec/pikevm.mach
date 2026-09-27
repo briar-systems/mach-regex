@@ -7,8 +7,8 @@
 # once, so a search takes time proportional to the program times the text,
 # whatever the pattern. new threads start only at code point boundaries, and
 # only until a match is found. when no thread is alive and the program has a
-# required prefix, the search jumps to its next occurrence, found sixteen
-# bytes at a time. leftmost-first cuts the threads after a match,
+# required prefix or a small set of first bytes, the search jumps to the next
+# place a match could begin. leftmost-first cuts the threads after a match,
 # and leftmost-longest keeps them but drops any that started after it, as RE2
 # does. all scratch is in a Cache sized for the program, so a search makes
 # no allocation.
@@ -16,7 +16,6 @@
 use A: std.allocator;
 use std.collections.vector;
 use std.collections.vector.Vector;
-use std.math.bits;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -24,10 +23,11 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.view.View;
 
+use regex.compile.program;
 use regex.compile.program.Assert;
 use regex.compile.program.Inst;
 use regex.compile.program.Prog;
-use regex.compile.program.Trans;
+use regex.exec.prefix;
 
 # a capture slot no thread has set
 pub val NONE: usize = 0xFFFFFFFFFFFFFFFF;
@@ -166,7 +166,12 @@ fun is_word(b: u8) bool {
 }
 
 # whether an assertion holds at a position of the text
-fun holds(a: Assert, text: View, at: usize) bool {
+# ---
+# a:    the assertion
+# text: the text
+# at:   the position
+# ret:  whether it holds there
+pub fun holds(a: Assert, text: View, at: usize) bool {
     if (sel a.begin_text) { ret at == 0; }
     if (sel a.end_text)   { ret at == text.len; }
     if (sel a.begin_line) { ret at == 0 || text.data[at - 1] == '\n'; }
@@ -178,7 +183,11 @@ fun holds(a: Assert, text: View, at: usize) bool {
 }
 
 # whether a position does not split a utf-8 sequence
-fun boundary(text: View, at: usize) bool {
+# ---
+# text: the text
+# at:   the position
+# ret:  whether a code point may begin there
+pub fun boundary(text: View, at: usize) bool {
     ret at == 0 || at >= text.len || (text.data[at] & 0xC0) != 0x80;
 }
 
@@ -238,60 +247,6 @@ fun add(p: *Prog, c: *Cache, l: *List, start: u32, text: View, at: usize, active
     }
 }
 
-# the first position at or after from holding a byte, or the text's length
-fun scan(text: View, from: usize, b: u8) usize {
-    val needle: u8x16 = u8x16{b, b, b, b, b, b, b, b, b, b, b, b, b, b, b, b};
-    var at:     usize = from;
-    for (at + 16 <= text.len) {
-        val chunk: u8x16 = text.data[at, 16]::u8x16;
-        val hits:  u64x2 = (chunk == needle):~u64x2;
-        # lane 0 is the lowest byte, so the first hit is the lowest set byte
-        val low: u64 = hits[0];
-        if (low != 0) { ret at + (bits.ctz(low) / 8)::usize; }
-        val high: u64 = hits[1];
-        if (high != 0) { ret at + 8 + (bits.ctz(high) / 8)::usize; }
-        at = at + 16;
-    }
-    for (at < text.len && text.data[at] != b) { at = at + 1; }
-    ret at;
-}
-
-# the first position at or after from where the program's prefix begins, or NONE
-fun candidate(p: *Prog, text: View, from: usize) usize {
-    val n:  usize = p.prefix_len::usize;
-    var at: usize = from;
-    for (at + n <= text.len) {
-        at = scan(text, at, p.prefix[0]);
-        if (at + n > text.len) { ret NONE; }
-        var k: usize = 1;
-        for (k < n && text.data[at + k] == p.prefix[k]) { k = k + 1; }
-        if (k == n) { ret at; }
-        at = at + 1;
-    }
-    ret NONE;
-}
-
-# the successor of a byte through a sparse instruction's transitions, or none
-fun through(p: *Prog, start: u32, len: u32, b: u8, next: *u32) bool {
-    var lo: u32 = 0;
-    var hi: u32 = len;
-    for (lo < hi) {
-        val mid: u32   = lo + (hi - lo) / 2;
-        val t:   Trans = p.trans.data[start + mid];
-        if (b < t.lo) {
-            hi = mid;
-        }
-        or (b > t.hi) {
-            lo = mid + 1;
-        }
-        or {
-            @next = t.next;
-            ret true;
-        }
-    }
-    ret false;
-}
-
 # search a text for the program's match
 #
 # the best match's slots are left in out, the first active of them, with
@@ -307,6 +262,25 @@ fun through(p: *Prog, start: u32, len: u32, b: u8, next: *u32) bool {
 # out:      where the slots of the match go, active of them
 # ret:      whether there is a match
 pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, longest: bool, active: usize, out: *usize) bool {
+    ret search_within(p, c, text, start, text.len, anchored, longest, active, out);
+}
+
+# search a text for the program's match, reading no byte at or past limit
+#
+# assertions still see the whole text, so a match known to end by limit is
+# found with the same groups, as when the lazy dfas have found its bounds.
+# ---
+# p:        the program
+# c:        scratch sized for the program
+# text:     the text
+# start:    where the search begins, a code point boundary
+# limit:    where reading stops, at most the text's length
+# anchored: a match must begin at start
+# longest:  leftmost-longest rather than leftmost-first
+# active:   how many slots to record, at least 2 and at most the program's
+# out:      where the slots of the match go, active of them
+# ret:      whether there is a match
+pub fun search_within(p: *Prog, c: *Cache, text: View, start: usize, limit: usize, anchored: bool, longest: bool, active: usize, out: *usize) bool {
     var cur:     *List = ?c.cur;
     var nxt:     *List = ?c.nxt;
     var matched: bool  = false;
@@ -315,10 +289,8 @@ pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, lo
     c.steps = 0;
     for {
         # with nothing running, no match can begin before the prefix's next occurrence
-        if (!matched && !anchored && cur.len == 0 && p.prefix_len > 0) {
-            val next: usize = candidate(p, text, at);
-            if (next == NONE) { brk; }
-            at = next;
+        if (!matched && !anchored && cur.len == 0 && prefix.skips(p)) {
+            if (!prefix.candidate(p, text, at, ?at)) { brk; }
         }
         # a new thread starting here, after every thread already running
         if (!matched && (at == start || !anchored) && boundary(text, at)) {
@@ -330,7 +302,7 @@ pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, lo
             add(p, c, cur, p.start, text, at, active);
         }
         if (cur.len == 0) {
-            if (matched || anchored || at >= text.len) { brk; }
+            if (matched || anchored || at >= limit) { brk; }
             at = at + 1;
             cnt;
         }
@@ -358,18 +330,10 @@ pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, lo
                 if (!longest) { brk; }
                 cnt;
             }
-            if (at >= text.len) { cnt; }
-            val b:    u8   = text.data[at];
-            var next: u32  = 0;
-            var take: bool = false;
-            if (sel i.range) {
-                take = b >= i.range.lo && b <= i.range.hi;
-                next = i.range.next;
-            }
-            or (sel i.sparse) {
-                take = through(p, i.sparse.start, i.sparse.len, b, ?next);
-            }
-            if (!take) { cnt; }
+            if (at >= limit) { cnt; }
+            val b:    u8  = text.data[at];
+            var next: u32 = 0;
+            if (!program.step(p, i, b, ?next)) { cnt; }
             var k: usize = 0;
             for (k < active) {
                 c.thread.data[k] = cur.slots.data[row + k];
@@ -380,7 +344,7 @@ pub fun search(p: *Prog, c: *Cache, text: View, start: usize, anchored: bool, lo
         val swap: *List = cur;
         cur = nxt;
         nxt = swap;
-        if (at >= text.len) { brk; }
+        if (at >= limit) { brk; }
         at = at + 1;
     }
     if (!matched) { ret false; }
