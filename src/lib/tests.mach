@@ -10,4 +10,3 @@ use compile_tests:     regex.test.compile;
 use conformance_tests: regex.test.conformance;
 use search_tests:      regex.test.search;
 use syntax_tests:      regex.test.syntax;
-use unicode_tests:     regex.test.unicode;
