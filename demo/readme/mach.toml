@@ -1,0 +1,85 @@
+# the README's examples, each a program of its own
+[project]
+id = "readme"
+version = "0.1.0"
+mach = "^6"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[target.linux-aarch64]
+isa = "aarch64"
+os  = "linux"
+abi = "aapcs64"
+
+[target.windows-x86_64]
+isa = "x86_64"
+os  = "windows"
+abi = "win64"
+
+[target.darwin-x86_64]
+isa = "x86_64"
+os  = "darwin"
+abi = "sysv64"
+
+[target.darwin-aarch64]
+isa = "aarch64"
+os  = "darwin"
+abi = "aapcs64"
+
+[artifact.search]
+kind = "bin"
+entry = "bin/search.mach"
+out = "bin/search"
+targets = ["*"]
+link = []
+need = []
+
+[artifact.captures]
+kind = "bin"
+entry = "bin/captures.mach"
+out = "bin/captures"
+targets = ["*"]
+link = []
+need = []
+
+[artifact.iterate]
+kind = "bin"
+entry = "bin/iterate.mach"
+out = "bin/iterate"
+targets = ["*"]
+link = []
+need = []
+
+[artifact.options]
+kind = "bin"
+entry = "bin/options.mach"
+out = "bin/options"
+targets = ["*"]
+link = []
+need = []
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[dep.regex]
+path = "../.."
+
+[dep.std]
+path = "../../dep/std"

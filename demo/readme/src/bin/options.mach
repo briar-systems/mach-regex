@@ -1,0 +1,59 @@
+# compile with options, report a bad pattern and match literal text
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use regex;
+
+fun text(s: str) View {
+    ret view(s, str_len(s));
+}
+
+# whether a pattern compiled with options matches a text
+fun matches(a: *allocator.Allocator, pattern: View, o: regex.Options, hay: View) bool {
+    var re: res[regex.Regex, regex.Error] = regex.compile_with(a, pattern, o);
+    if (sel re.err) { ret false; }
+    fin { regex.dnit(?re.ok); }
+    var c: res[regex.Cache, regex.Error] = regex.cache(a, ?re.ok);
+    if (sel c.err) { ret false; }
+    fin { regex.cache_dnit(?c.ok); }
+    ret regex.is_match(?re.ok, ?c.ok, hay);
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var a: allocator.Allocator;
+    page.make(?a);
+
+    var o: regex.Options;
+    o.case_insensitive = true;
+    print.printlnf("case insensitive: {}", matches(?a, text("hello"), o, text("Say HeLLo")));
+
+    var bad: res[regex.Regex, regex.Error] = regex.compile(?a, text("a(b"));
+    if (sel bad.ok) {
+        regex.dnit(?bad.ok);
+        ret 1;
+    }
+    print.printlnf("error at byte {}: {}", bad.err.offset, regex.error_text(bad.err));
+
+    # quote escapes every metacharacter, so the pattern matches the text exactly
+    var quoted: Vector[u8] = vector.init[u8](?a);
+    fin { vector.dnit[u8](?quoted); }
+    if (!regex.quote(text("1.5+2"), ?quoted)) { ret 1; }
+    var plain: regex.Options;
+    print.printlnf("quoted: {}", matches(?a, view(quoted.data, quoted.len), plain, text("is 1.5+2 = 3.5")));
+    print.printlnf("quoted: {}", matches(?a, view(quoted.data, quoted.len), plain, text("is 105 + 2")));
+    ret 0;
+}
