@@ -54,6 +54,13 @@ A pattern whose every match begins with the same literal bytes, as `hello` in
 `hello\s+world`, is searched faster: while no match is in progress, the search
 skips to the next place those bytes occur, scanning sixteen bytes at a time.
 
+Captures of a pattern bound to the start of the text, as `^(\w+)@(\w+)` without
+`(?m)`, searched from the start, take a faster path when the pattern is
+one-pass: when at every step at most one way of matching can still go on. Such
+a pattern is compiled once more into a table, and its captures are found in a
+single pass over the text, as RE2 and Rust do, with the same result the general
+engine gives.
+
 Compiling allocates through the allocator it is given. A search runs entirely
 in its `Cache` and allocates nothing.
 
