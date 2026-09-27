@@ -95,17 +95,24 @@ pub tag Inst: u8 {
     look:   Look;
 }
 
+# the most bytes of a required prefix a program keeps
+pub val MAX_PREFIX: u32 = 16;
+
 # a compiled program
 # ---
-# insts: the instructions
-# trans: the transitions of every sparse instruction
-# start: the first instruction
-# slots: the number of capture slots, two per group and two for the whole match
+# insts:      the instructions
+# trans:      the transitions of every sparse instruction
+# start:      the first instruction
+# slots:      the number of capture slots, two per group and two for the whole match
+# prefix:     bytes every match begins with, the first prefix_len of them
+# prefix_len: how many bytes of prefix are required, 0 for none
 pub rec Prog {
-    insts: Vector[Inst];
-    trans: Vector[Trans];
-    start: u32;
-    slots: u32;
+    insts:      Vector[Inst];
+    trans:      Vector[Trans];
+    start:      u32;
+    slots:      u32;
+    prefix:     [16]u8;
+    prefix_len: u32;
 }
 
 # an empty program drawing on an allocator
@@ -113,7 +120,7 @@ pub rec Prog {
 # a:   the allocator its vectors grow in
 # ret: the program, owning nothing until it grows
 pub fun init(a: *A.Allocator) Prog {
-    ret Prog{insts: vector.init[Inst](a), trans: vector.init[Trans](a), start: 0, slots: 0};
+    ret Prog{insts: vector.init[Inst](a), trans: vector.init[Trans](a), start: 0, slots: 0, prefix_len: 0};
 }
 
 # release everything a program holds

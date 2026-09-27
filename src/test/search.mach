@@ -245,3 +245,43 @@ test quote__matches_its_text_exactly {
     testing.dnit(?t);
     ret 0;
 }
+
+test search__prefix_scan_steps_only_at_candidates {
+    var o: regex.Options;
+    var f: Fixture;
+    open(?f, "(hello) \\w+", o);
+    if (!f.ok || f.re.prog.prefix_len != 6) { ret 1; }
+    # a decoy that shares the first bytes, then the match past a long run of filler
+    var big: [10020]u8;
+    var k:   usize = 0;
+    for (k < 10000) {
+        big[k] = 'x';
+        k      = k + 1;
+    }
+    big[5000] = 'h';
+    big[5001] = 'e';
+    big[5002] = 'l';
+    big[5003] = 'p';
+    val tail: str = "hello world";
+    k = 0;
+    for (k < 11) {
+        big[10000 + k] = tail[k];
+        k              = k + 1;
+    }
+    big[10011] = 0;
+    if (!finds(?f, ?big[0], 0, 10000, 10011)) { ret 2; }
+    # the vm ran only from the one candidate through the match
+    if (f.c.vm.steps > 16) { ret 3; }
+    if (!close(?f))        { ret 4; }
+    # no prefix is taken past a choice, a fold or an assertion
+    open(?f, "(?i)hello", o);
+    if (!f.ok || f.re.prog.prefix_len != 0) { ret 5; }
+    if (!close(?f))                         { ret 6; }
+    open(?f, "ab|ac", o);
+    if (!f.ok || f.re.prog.prefix_len != 0) { ret 7; }
+    if (!close(?f))                         { ret 8; }
+    open(?f, "^ab", o);
+    if (!f.ok || f.re.prog.prefix_len != 0) { ret 9; }
+    if (!close(?f))                         { ret 10; }
+    ret 0;
+}
