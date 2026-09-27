@@ -49,6 +49,31 @@ release a cache's scratch
 
 c: the cache
 
+## fun holds
+
+```mach
+pub fun holds(a: Assert, text: View, at: usize) bool;
+```
+
+whether an assertion holds at a position of the text
+
+a: the assertion
+text: the text
+at: the position
+ret: whether it holds there
+
+## fun boundary
+
+```mach
+pub fun boundary(text: View, at: usize) bool;
+```
+
+whether a position does not split a utf-8 sequence
+
+text: the text
+at: the position
+ret: whether a code point may begin there
+
 ## fun search
 
 ```mach
