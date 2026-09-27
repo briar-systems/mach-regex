@@ -120,6 +120,15 @@ pub val MAX_FIRSTS: u32 = 16
 
 the most first bytes a program keeps
 
+## val RANK
+
+```mach
+pub val RANK: [256]u8 = [256]u8;
+```
+
+how common each byte is in typical text, higher for more common, from the
+memchr crate's default ranking, which is in the public domain
+
 ## rec Prog
 
 ```mach
