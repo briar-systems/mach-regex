@@ -101,6 +101,9 @@ pub tag Inst: u8 {
 # the most bytes of a required prefix a program keeps
 pub val MAX_PREFIX: u32 = 16;
 
+# the most first bytes a program keeps
+pub val MAX_FIRSTS: u32 = 16;
+
 # a compiled program
 # ---
 # insts:       the instructions
@@ -110,7 +113,7 @@ pub val MAX_PREFIX: u32 = 16;
 # prefix:      bytes every match begins with, the first prefix_len of them
 # prefix_len:  how many bytes of prefix are required, 0 for none
 # firsts:      the bytes every match begins with one of, the first first_count of them
-# first_count: how many, 1 to 3, or 0 when there are more or a match can begin without a byte
+# first_count: how many, 1 to 16, or 0 when there are more or a match can begin without a byte
 # classes:     each byte's class. the program never tells two bytes of a class apart
 # class_count: how many classes there are
 pub rec Prog {
@@ -120,7 +123,7 @@ pub rec Prog {
     slots:       u32;
     prefix:      [16]u8;
     prefix_len:  u32;
-    firsts:      [3]u8;
+    firsts:      [16]u8;
     first_count: u32;
     classes:     [256]u8;
     class_count: u32;

@@ -3,7 +3,7 @@
 # a search with no thread alive can skip ahead. when every match begins with
 # the same literal bytes, it scans for the rarest of them sixteen bytes at a
 # time and checks the rest around it. when every match begins with one of at
-# most three bytes, it scans for any of them.
+# most sixteen bytes, it compares sixteen bytes at a time with each of them.
 
 use A: std.allocator;
 use std.allocator.testing;
@@ -70,26 +70,39 @@ pub fun skips(p: *Prog) bool {
     ret p.prefix_len > 0 || p.first_count > 0;
 }
 
-# the first position at or after from holding any of two or three bytes, or the text's length
+# the first position at or after from holding any of the program's two to
+# sixteen first bytes, or the text's length
 fun scan_any(text: View, from: usize, p: *Prog) usize {
-    val b0: u8 = p.firsts[0];
-    val b1: u8 = p.firsts[1];
-    var b2: u8 = p.firsts[1];
-    if (p.first_count == 3) { b2 = p.firsts[2]; }
-    val n0: u8x16 = u8x16{b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0, b0};
-    val n1: u8x16 = u8x16{b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1, b1};
-    val n2: u8x16 = u8x16{b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2, b2};
+    val n:       usize = p.first_count::usize;
+    var needles: [16]u8x16;
+    var j:       usize = 0;
+    for (j < n) {
+        val b: u8 = p.firsts[j];
+        needles[j] = u8x16{b, b, b, b, b, b, b, b, b, b, b, b, b, b, b, b};
+        j          = j + 1;
+    }
     var at: usize = from;
     for (at + 16 <= text.len) {
         val chunk: u8x16 = text.data[at, 16]::u8x16;
-        val hits:  u64x2 = ((chunk == n0) | (chunk == n1) | (chunk == n2)):~u64x2;
-        val low:   u64   = hits[0];
+        var any:   u8x16 = chunk == needles[0];
+        j = 1;
+        for (j < n) {
+            any = any | (chunk == needles[j]);
+            j   = j + 1;
+        }
+        val hits: u64x2 = any:~u64x2;
+        val low:  u64   = hits[0];
         if (low != 0) { ret at + (bits.ctz(low) / 8)::usize; }
         val high: u64 = hits[1];
         if (high != 0) { ret at + 8 + (bits.ctz(high) / 8)::usize; }
         at = at + 16;
     }
-    for (at < text.len && text.data[at] != b0 && text.data[at] != b1 && text.data[at] != b2) { at = at + 1; }
+    for (at < text.len) {
+        j = 0;
+        for (j < n && text.data[at] != p.firsts[j]) { j = j + 1; }
+        if (j < n) { ret at; }
+        at = at + 1;
+    }
     ret at;
 }
 
@@ -174,5 +187,20 @@ test candidate__any_of_the_first_bytes {
     if (next_in("(?i)sherlock", text, 21) != 25)           { ret 2; }
     if (next_in("a|bc|c", "xxxxcxxxxxxxxxxxxxb", 0) != 4)  { ret 3; }
     if (next_in("a|bc|c", "xxxxcxxxxxxxxxxxxxb", 5) != 18) { ret 4; }
+    ret 0;
+}
+
+test candidate__many_first_bytes {
+    val holmes: str = "Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty";
+    if (next_in(holmes, "xxxxxxxxxxxxxxxxxxxxJohn Irene", 0) != 20)  { ret 1; }
+    if (next_in(holmes, "xxxxxxxxxxxxxxxxxxxxJohn Irene", 21) != 25) { ret 2; }
+    # the last byte of the first chunk, in the second chunk, and in the tail
+    val sixteen: str = "a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p";
+    val text:    str = "xxxxxxxxxxxxxxxkxpxxxxxxxxxxxxxxxa";
+    if (next_in(sixteen, text, 0) != 15)  { ret 3; }
+    if (next_in(sixteen, text, 16) != 17) { ret 4; }
+    if (next_in(sixteen, text, 19) != 33) { ret 5; }
+    # seventeen first bytes are too many to skip by
+    if (next_in("a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q", "xxa", 0) != 3) { ret 6; }
     ret 0;
 }

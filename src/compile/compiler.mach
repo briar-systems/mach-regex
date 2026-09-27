@@ -275,11 +275,11 @@ fun classify(p: *Prog) {
     p.class_count = n + 1;
 }
 
-# the bytes every match begins with one of, when there are at most three
+# the bytes every match begins with one of, when there are at most sixteen
 #
 # they are the ranges reached from the start through saves and choices alone.
-# an assertion or a match before any byte, or a fourth byte, leaves none, since
-# then a search cannot skip to the next of them.
+# an assertion or a match before any byte, or a seventeenth byte, leaves none,
+# since then a search cannot skip to the next of them.
 fun firsts(c: *Compiler, a: *A.Allocator) {
     val p:       *Prog       = c.prog;
     var visited: Vector[u8]  = vector.init[u8](a);
@@ -334,7 +334,7 @@ fun firsts(c: *Compiler, a: *A.Allocator) {
         or (sel i.look || sel i.match) {
             ret;
         }
-        if (count > 3) { ret; }
+        if (count > prog.MAX_FIRSTS) { ret; }
         var m: usize = 0;
         for (m < more) {
             val pushed: res[usize, A.Error] = vector.push[u32](?stack, next[m]);
@@ -359,11 +359,11 @@ fun firsts(c: *Compiler, a: *A.Allocator) {
 }
 
 # mark the bytes of a range among the first bytes, giving the new count, which
-# stops mattering once it passes three
+# stops mattering once it passes sixteen
 fun add_firsts(bytes: *u8, count: u32, lo: u8, hi: u8) u32 {
     var n: u32   = count;
     var b: usize = lo::usize;
-    for (b <= hi::usize && n <= 3) {
+    for (b <= hi::usize && n <= prog.MAX_FIRSTS) {
         if (bytes[b] == 0) {
             bytes[b] = 1;
             n        = n + 1;
@@ -1175,15 +1175,22 @@ test compile__first_bytes {
     open(?c, "a|bc|c");
     if (!c.ok || c.prog.first_count != 3) { ret 3; }
     if (!close(?c))                       { ret 4; }
-    # four bytes, an assertion first, or a match without a byte leave none
-    open(?c, "a|b|c|d");
-    if (!c.ok || c.prog.first_count != 0) { ret 5; }
-    if (!close(?c))                       { ret 6; }
-    open(?c, "\\ba");
-    if (!c.ok || c.prog.first_count != 0) { ret 7; }
-    if (!close(?c))                       { ret 8; }
-    open(?c, "x*");
+    # an alternation of literals keeps each first byte once, in byte order
+    open(?c, "Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty");
+    if (!c.ok || c.prog.first_count != 4 || c.prog.firsts[0] != 'I' || c.prog.firsts[1] != 'J' || c.prog.firsts[2] != 'P' || c.prog.firsts[3] != 'S') { ret 5; }
+    if (!close(?c))                                                                                                                                   { ret 6; }
+    open(?c, "a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p");
+    if (!c.ok || c.prog.first_count != 16 || c.prog.firsts[15] != 'p') { ret 7; }
+    if (!close(?c))                                                    { ret 8; }
+    # a seventeenth byte, an assertion first, or a match without a byte leave none
+    open(?c, "a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q");
     if (!c.ok || c.prog.first_count != 0) { ret 9; }
     if (!close(?c))                       { ret 10; }
+    open(?c, "\\ba");
+    if (!c.ok || c.prog.first_count != 0) { ret 11; }
+    if (!close(?c))                       { ret 12; }
+    open(?c, "x*");
+    if (!c.ok || c.prog.first_count != 0) { ret 13; }
+    if (!close(?c))                       { ret 14; }
     ret 0;
 }
