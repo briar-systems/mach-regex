@@ -1,7 +1,7 @@
 [project]
 id = "regex"
 version = "0.1.0"
-mach = "^5.10"
+mach = "^6"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -30,21 +30,24 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
+# the library, and the only artifact `mach build .` and `--all-targets` select
 [artifact.regex]
-kind = "bin"
-entry = "main.mach"
-out = "bin/regex{artifact.suffix}"
+kind = "static"
+default = true
+entry = "lib/regex.mach"
+out = "lib/regex"
 targets = ["*"]
-link = ["kernel32"]
+link = []
 need = []
 
-[link.kernel32]
-source = "system"
-name = "kernel32.dll"
-os = ["windows"]
-isa = ["*"]
-abi = ["*"]
-export = false
+# test-only: the library and every test module, run with `mach test . --lib tests`
+[artifact.tests]
+kind = "static"
+entry = "lib/tests.mach"
+out = "lib/tests"
+targets = ["*"]
+link = []
+need = []
 
 [profile.debug]
 default = true
@@ -63,4 +66,4 @@ float_reassoc = false
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^7.0.2"
+version = "^9.0"

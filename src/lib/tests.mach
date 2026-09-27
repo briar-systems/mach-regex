@@ -1,0 +1,7 @@
+# the library and every test module it does not reach
+#
+# `mach test . --lib tests` runs all of mach-regex's tests.
+
+use std.runtime;
+
+use regex.lib.regex;
