@@ -130,8 +130,9 @@ admins can bypass these rules to cut a release. Once a `v*` tag is pushed, only
 an admin can move or delete it.
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org), with
-the issue number as the scope: `fix(#12): reject a negative length`. A change
-that users will notice gets a line under `[Unreleased]` in `CHANGELOG.md`.
+the issue number as the scope: `fix(#12): reject a negative length`. The
+changelog is written at release from the merged commits, so a pull request for
+an issue leaves `CHANGELOG.md` alone.
 
 Issues are labeled on independent axes:
 
@@ -160,8 +161,9 @@ compiler version in `ci.yml` together with the `mach` range in `mach.toml`.
 
 ## Releases
 
-1. Set `version` in `mach.toml` and move `[Unreleased]` in `CHANGELOG.md` to the
-   release's section, and merge that into `dev`.
+1. On a `chore/release-X.Y.Z` branch off `dev`, set `version` in `mach.toml` and
+   write the release's section of `CHANGELOG.md` from the commits merged since
+   the last release, and merge that into `dev` as `chore(release): X.Y.Z`.
 2. Merge `dev` into `main` through a pull request, which runs every leg.
 3. Tag `main` and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
