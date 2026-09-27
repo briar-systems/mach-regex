@@ -66,8 +66,13 @@ skips to the next place those bytes occur, scanning sixteen bytes at a time.
 `captures` needs only the groups of a match whose bounds the DFA has found. A
 one-pass pattern, one where at every step at most one way of matching can
 still go on, is compiled once more into a table that resolves them in a single
-pass, as RE2 and Rust do. Any other pattern runs the Pike VM from where the
-match begins. Either way the result is the one the Pike VM alone would give.
+pass, as RE2 and Rust do. Any other pattern, when the text from the match's
+start is short enough, runs a backtracker, which follows one way at a time but
+marks every instruction and position it reaches and never enters one twice, so
+it keeps the same bound with less work per byte. It applies while the compiled
+pattern's size times that length stays within 256K and its stack of 16K frames
+holds the worst case. Anything longer runs the Pike VM from where the match
+begins. Every path gives the result the Pike VM alone would give.
 
 Compiling allocates through the allocator it is given. A search runs entirely
 in its `Cache` and allocates nothing.

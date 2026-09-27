@@ -62,7 +62,7 @@ stride: transitions per state, one per byte class and one for the edge of the te
 need: the context flags the program's assertions read
 cap: the most states the arena holds
 count: states in use
-trans: each state's row of transitions, UNKNOWN where not yet computed
+trans: each state's row of transitions, tagged, UNKNOWN where not yet computed
 lists: where each state's list begins in the pool
 lens: each state's list length
 flags: each state's flags
@@ -70,7 +70,7 @@ hashes: each state's hash
 pool: the states' lists
 used: pool entries in use
 table: states by hash, open addressed, a state's index plus one or 0 for none
-starts: the start state for each context, UNKNOWN until made
+starts: the start state for each context, tagged, UNKNOWN until made
 q: the closure being taken, every instruction reached in order, with marks
 qlen: entries in q
 at_q: where each instruction sits in q, meaningful only for members

@@ -59,6 +59,7 @@ pub rec Cache;
 the scratch of searching with one Regex
 
 vm: the pike vm's scratch
+bt: the bounded backtracker's scratch
 one: the one-pass engine's scratch
 fwd: the lazy dfa that finds where a match ends
 bwd: the lazy dfa that finds where it begins
