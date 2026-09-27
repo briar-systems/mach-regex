@@ -18,21 +18,21 @@ use std.types.size.usize;
 use std.types.view.View;
 use std.types.view.view;
 
-use regex.syntax.ast;
-use regex.syntax.ast.Ast;
-use regex.syntax.ast.Capture;
-use regex.syntax.ast.Class;
-use regex.syntax.ast.Flags;
-use regex.syntax.ast.Item;
-use regex.syntax.ast.Literal;
-use regex.syntax.ast.Node;
-use regex.syntax.ast.Range;
-use regex.syntax.ast.Repeat;
-use regex.syntax.ast.Set;
-use regex.syntax.ast.Span;
-use regex.syntax.ast.Unicode;
-use regex.syntax.error.Error;
-use regex.syntax.error.Kind;
+use regex.syntax.errors.Error;
+use regex.syntax.errors.Kind;
+use ast: regex.syntax.tree;
+use regex.syntax.tree.Ast;
+use regex.syntax.tree.Capture;
+use regex.syntax.tree.Class;
+use regex.syntax.tree.Flags;
+use regex.syntax.tree.Item;
+use regex.syntax.tree.Literal;
+use regex.syntax.tree.Node;
+use regex.syntax.tree.Range;
+use regex.syntax.tree.Repeat;
+use regex.syntax.tree.Set;
+use regex.syntax.tree.Span;
+use regex.syntax.tree.Unicode;
 
 # the largest repetition bound
 val MAX_REPEAT: u32 = 1000;
