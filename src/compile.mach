@@ -5,7 +5,7 @@
 # sequences, and capture slots two per group.
 
 use regex.compile.compiler;
-use regex.compile.prog;
+use prog: regex.compile.program;
 use regex.compile.utf8;
 
 fwd compiler.compile;

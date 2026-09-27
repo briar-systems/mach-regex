@@ -4,9 +4,9 @@
 # class names symbolic, so resolving them against the unicode tables is the
 # compiler's work.
 
-use regex.syntax.ast;
-use regex.syntax.error;
+use error:  regex.syntax.errors;
 use parser: regex.syntax.parse;
+use ast:    regex.syntax.tree;
 
 fwd ast.Ast;
 fwd ast.Capture;

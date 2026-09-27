@@ -24,10 +24,10 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.view.View;
 
-use regex.compile.prog.Assert;
-use regex.compile.prog.Inst;
-use regex.compile.prog.Prog;
-use regex.compile.prog.Trans;
+use regex.compile.program.Assert;
+use regex.compile.program.Inst;
+use regex.compile.program.Prog;
+use regex.compile.program.Trans;
 
 # a capture slot no thread has set
 pub val NONE: usize = 0xFFFFFFFFFFFFFFFF;
