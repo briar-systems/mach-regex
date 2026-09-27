@@ -126,6 +126,8 @@ start: the first instruction
 slots: the number of capture slots, two per group and two for the whole match
 prefix: bytes every match begins with, the first prefix_len of them
 prefix_len: how many bytes of prefix are required, 0 for none
+classes: each byte's class. the program never tells two bytes of a class apart
+class_count: how many classes there are
 
 ## fun init
 
