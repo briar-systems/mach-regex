@@ -29,7 +29,7 @@ mach fmt --check demo/search
 | --- | --- |
 | `src/syntax/` | the parser, from pattern text to a syntax tree, and its errors |
 | `src/compile/` | the compiler, from a tree to a byte program with UTF-8 automata for classes |
-| `src/exec/` | the Pike VM that runs a program over a text |
+| `src/exec/` | the engines that run a program over a text, the Pike VM and the bounded backtracker |
 | `src/api.mach` | the public API, forwarded by `src/lib/regex.mach` |
 | `src/unicode/` | the generated Unicode tables and their lookups |
 | `src/data/` | the conformance data, embedded by `src/api.mach` |

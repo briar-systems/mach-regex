@@ -50,6 +50,12 @@ thread per instruction, and never backtracks, so no pattern can make a search
 run away: `(a*)*b` against a long run of `a` fails in one pass. This is what
 rules out the syntax RE2 leaves out, as the [syntax](syntax.md) guide explains.
 
+`captures` over a short enough rest of the text runs a backtracker instead,
+which follows one way at a time but marks every instruction and position it
+reaches and never enters one twice, so it keeps the same bound with less work
+per byte. It applies while the compiled pattern's size times the length
+searched stays within 256K, and gives exactly the same match and groups.
+
 A pattern whose every match begins with the same literal bytes, as `hello` in
 `hello\s+world`, is searched faster: while no match is in progress, the search
 skips to the next place those bytes occur, scanning sixteen bytes at a time.
