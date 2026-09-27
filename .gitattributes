@@ -1,2 +1,2 @@
 # embedded test data is read byte for byte, so git never converts its line endings
-src/test/data/* -text
+src/data/* -text
