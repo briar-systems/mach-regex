@@ -2,7 +2,7 @@
 
 ## Building and testing
 
-The compiler version is `mach-version` in `.github/workflows/ci.yml`, within the
+The compiler version is `MACH_VERSION` in `.github/workflows/ci.yml`, within the
 `mach` range in `mach.toml`.
 
 ```sh
@@ -16,7 +16,7 @@ module, so `mach test .` runs them all. The suites that exercise the whole API,
 searching and conformance, are in `src/api.mach`. `--filter` narrows a run, as
 `mach test . --filter parse`.
 
-Formatting is checked in CI for the library and every demo:
+Check formatting for the library and every demo:
 
 ```sh
 mach fmt --check .
@@ -33,7 +33,7 @@ mach fmt --check demo/search
 | `src/api.mach` | the public API, forwarded by `src/lib/regex.mach` |
 | `src/unicode/` | the generated Unicode tables and their lookups |
 | `src/data/` | the conformance data, embedded by `src/api.mach` |
-| `demo/` | one example program per project, built by CI |
+| `demo/` | one example program per project |
 | `doc/` | the generated API reference and the hand-written guides in `doc/guide/` |
 | `src/bin/rebar.mach` | the rebar runner, for benchmarks |
 | `tools/` | generators for committed sources |
@@ -89,7 +89,7 @@ implements the compile, count, count-spans, count-captures, grep and
 grep-captures models.
 
 ```sh
-mach build . --profile release --bin rebar
+mach build . --profile release -a rebar
 ```
 
 In a rebar checkout, add the engine to `benchmarks/engines.toml`, with `cwd` the
@@ -106,7 +106,7 @@ path to this checkout:
     bin = "./out/linux-x86_64/release/bin/rebar"
   [[engine.build]]
     bin = "mach"
-    args = ["build", ".", "--profile", "release", "--bin", "rebar"]
+    args = ["build", ".", "--profile", "release", "-a", "rebar"]
 ```
 
 and add `mach/regex` to the `engines` of each benchmark it should run. It has
@@ -146,27 +146,24 @@ Issues are labeled on independent axes:
 
 ## CI
 
-`.github/workflows/ci.yml` runs the shared Mach library pipeline,
-`mach-lib.yml` from `briar-systems/.github`. A pull request into `dev` builds
-and tests on `x86_64-linux`, checks formatting, builds every demo and
-cross-builds every manifest target in release. A pull request into `main` runs
-every leg. To run every leg on any branch, use
-`gh workflow run CI --ref <branch> -f heavy=all`.
+`.github/workflows/ci.yml` checks formatting and runs `mach test . --all` on
+`x86_64-linux`, which builds every artifact for every manifest target and tests
+the ones the runner can execute. To test on other hosts, dispatch it with
+`gh workflow run CI --ref <branch> -f runners='["macos-15"]'`. The demos, the
+Unicode tables (`python3 tools/unicode-tables --check`) and the API reference
+(`mach doc .` against `doc/`) are checked locally.
 
-`.github/ci/verify.sh` runs the repository's own checks on the primary leg: the
-Unicode tables and the API reference against fresh runs.
-
-The last job, `gate`, is the check the branch rules require. Change the
-compiler version in `ci.yml` together with the `mach` range in `mach.toml`.
+The last job, `gate`, is the check the branch rules require. Change
+`MACH_VERSION` in `ci.yml` and `cd.yml` together with the `mach` range in
+`mach.toml`.
 
 ## Releases
 
 1. On a `chore/release-X.Y.Z` branch off `dev`, set `version` in `mach.toml` and
    write the release's section of `CHANGELOG.md` from the commits merged since
    the last release, and merge that into `dev` as `chore(release): X.Y.Z`.
-2. Merge `dev` into `main` through a pull request, which runs every leg.
+2. Merge `dev` into `main` through a pull request.
 3. Tag `main` and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
-`.github/workflows/cd.yml` runs the shared release pipeline, which checks the
-tag against the manifest and the changelog, runs every CI leg and publishes the
-release.
+`.github/workflows/cd.yml` checks the tag against the manifest, tests every host
+the library ships to, packages the artifacts and publishes the release.
