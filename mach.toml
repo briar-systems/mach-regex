@@ -30,7 +30,7 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
-# the library. as the default, its entry is what a dependent's `use regex;` binds
+# the library. as the default, its entry is the module a dependent imports as `use regex.lib.regex;`
 [artifact.regex]
 kind = "static"
 default = true
