@@ -25,7 +25,7 @@ Add the dependency to a project:
 mach dep add . regex --git https://github.com/briar-systems/mach-regex --version ^0.2
 ```
 
-and import it with `use regex;`, the one module everything is reached through:
+and import it with `use regex.lib.regex;`, the one module everything is reached through:
 
 ```mach
 var re: res[regex.Regex, regex.Error] = regex.compile(?a, text("[a-z]+@[a-z]+\\.com"));
